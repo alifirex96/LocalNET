@@ -12,6 +12,7 @@ import sys
 import threading
 from pathlib import Path
 from typing import Callable, Optional
+from urllib.parse import unquote, urlparse
 
 # Размер блока для чтения файлов при хешировании и chunked-передаче.
 # 1 МБ — хороший компромисс: мало системных вызовов и небольшой расход памяти.
@@ -146,6 +147,17 @@ def safe_filename(name: str) -> str:
         stem_bytes = p.stem.encode("utf-8")[: 200 - len(ext.encode("utf-8"))]
         name = stem_bytes.decode("utf-8", "ignore") + ext
     return name
+
+
+def path_from_uri(value: str) -> str:
+    """``file:///home/u/%D0%A4.txt`` → ``/home/u/Ф.txt`` (перетаскивание/буфер обмена); путь — как есть."""
+    value = value.strip()
+    if value.startswith("file://"):
+        path = unquote(urlparse(value).path)
+        if os.name == "nt" and len(path) > 2 and path[0] == "/" and path[2] == ":":
+            path = path[1:]  # /C:/... → C:/...
+        return path
+    return value
 
 
 def unique_path(directory: Path, name: str) -> Path:

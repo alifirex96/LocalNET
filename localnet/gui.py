@@ -38,11 +38,17 @@ from .models import (
     TransferState,
 )
 from .utils import human_size, human_speed
+from .utils import path_from_uri as _path_from_uri
 
 log = logging.getLogger(__name__)
 
 FILES_VIEW = "__files__"
 POLL_MS = 100
+ROW_H = 76  # высота строки списка чатов
+
+# Физические коды клавиш V/C/X/A (X11 и Windows): в русской раскладке Tk не распознаёт
+# Ctrl+V и т.п. по символу (приходит «м»), поэтому дополнительно смотрим на код клавиши.
+_KEYCODES = {"paste": (55, 86), "copy": (54, 67), "cut": (53, 88), "select_all": (38, 65)}
 MAX_ITEMS_PER_CHAT = 1000
 
 
@@ -374,6 +380,10 @@ class LocalNetGui:
         self._files_loaded = False
         self.list_visible = True
         self._hover_hide: Optional[str] = None
+        self._drop_key: Optional[str] = None
+        self._overlay_key: Optional[str] = "-"
+        self._row_keys: list[tuple[float, float, str]] = []
+        self.dnd_enabled = False
         self._hover_shown: Optional[str] = None
         try:
             self._tile: Optional[tk.PhotoImage] = tk.PhotoImage(data=CHAT_TILE_PNG_B64)
@@ -388,6 +398,8 @@ class LocalNetGui:
         self._top_info = ""
 
         self._build()
+        self._setup_dnd()
+        self._setup_clipboard_keys()
 
     # ------------------------------------------------------------------ #
     # Построение
@@ -455,6 +467,7 @@ class LocalNetGui:
         self.input.bind("<Configure>", lambda _e: self._draw_input())
 
         self.toast = tk.Label(self.chat_frame, bg=C.TOAST, fg="#ffffff", font=self.f.preview, padx=14, pady=6)
+        self.drop_overlay = tk.Canvas(self.chat_frame, highlightthickness=0, bd=0, bg="#e8f3fc")
 
         for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
             self.root.bind_all(seq, self._on_wheel, add="+")
@@ -658,8 +671,9 @@ class LocalNetGui:
         cv, f = self.list, self.f
         cv.delete("all")
         w = max(cv.winfo_width(), 200)
-        row_h = 76
+        row_h = ROW_H
         rows = self._list_rows()
+        self._row_keys = []
         y = 0
         for key, name, peer in rows:
             selected = key == self.current
@@ -711,6 +725,10 @@ class LocalNetGui:
                            font=f.preview, fill=muted, anchor="w", tags=(tag,))
             if not selected:
                 cv.create_line(text_x, y + row_h - 1, w, y + row_h - 1, fill=C.LINE, tags=(tag,))
+            if key == self._drop_key:
+                rounded_rect(cv, 6, y + 3, w - 6, y + row_h - 3, 14, fill="", outline=C.ACCENT, width=2,
+                             dash=(6, 4), tags=(tag,))
+            self._row_keys.append((y, y + row_h, key))
             self._clickable(cv, tag, lambda k=key: self.select(k), cursor="")
             y += row_h
         if len(rows) == 1 and not self.search_query:
@@ -1495,18 +1513,198 @@ class LocalNetGui:
 
     def send_file(self) -> None:
         if self.current in (ALL_CHAT, FILES_VIEW):
-            self.show_toast("Выберите получателя в списке слева")
+            self.show_toast("Выберите получателя в списке слева (или перетащите файл на него)")
             return
         peer = self.core.registry.get(self.current)
         if peer is None or not peer.online:
-            self.show_toast("Пир сейчас не в сети")
+            self.show_toast(f"{self._name(self.current)} сейчас не в сети")
             return
         paths = filedialog.askopenfilenames(parent=self.root, title=f"Файлы для {peer.nickname}")
-        for path in paths:
+        if paths:
+            self.send_paths(self.current, list(paths))
+
+    def send_paths(self, key: Optional[str], paths: list[str]) -> int:
+        """Отправляет файлы в чат ``key`` (пиру или всем в общем чате). Возвращает число запущенных передач."""
+        files, dirs = [], []
+        for raw in paths:
+            path = _path_from_uri(raw)
+            if os.path.isdir(path):
+                dirs.append(path)
+            elif os.path.isfile(path):
+                files.append(path)
+        if dirs:
+            self.show_toast("Папки пока нельзя отправить целиком — выберите файлы или упакуйте папку в архив", 6000)
+        if not files:
+            return 0
+        if key is None or key == FILES_VIEW:
+            self.show_toast("Выберите получателя: откройте чат или перетащите файл на собеседника в списке")
+            return 0
+        if key == ALL_CHAT:
+            peers = self.core.registry.online()
+            if not peers:
+                self.show_toast("Сейчас в сети никого нет")
+                return 0
+            names = ", ".join(p.nickname for p in peers[:3]) + (f" и ещё {len(peers) - 3}" if len(peers) > 3 else "")
+            what = f"«{os.path.basename(files[0])}»" if len(files) == 1 else f"{len(files)} файл(а/ов)"
+            if not messagebox.askyesno(APP_NAME, f"Отправить {what} всем в сети ({len(peers)}):\n{names}?",
+                                       parent=self.root):
+                return 0
+            targets = [p.node_id for p in peers]
+        else:
+            peer = self.core.registry.get(key)
+            if peer is None or not peer.online:
+                self.show_toast(f"{self._name(key)} сейчас не в сети — файл не отправлен")
+                return 0
+            targets = [key]
+        started = 0
+        for target in targets:
+            for path in files:
+                try:
+                    self.core.send_file(target, path)
+                    started += 1
+                except (OSError, ValueError) as exc:
+                    self.show_toast(f"{os.path.basename(path)}: {exc}", 6000)
+        if started:
+            if key != ALL_CHAT and key != self.current:
+                self.select(key)
+            who = "всем в сети" if key == ALL_CHAT else self._name(key)
+            self.show_toast(f"Отправка {len(files)} файл(а/ов) → {who}")
+        return started
+
+    # ------------------------------------------------------------------ #
+    # Перетаскивание файлов (tkdnd) и вставка из буфера обмена
+    # ------------------------------------------------------------------ #
+
+    def _setup_dnd(self) -> None:
+        """Подключает tkdnd, если он есть (в готовой сборке — есть). Без него работают кнопка и Ctrl+V."""
+        try:
+            from tkinterdnd2 import DND_FILES, TkinterDnD  # noqa: F401 - импорт добавляет методы виджетам
+            TkinterDnD._require(self.root)
+        except Exception as exc:  # noqa: BLE001 - нет модуля, нет библиотеки, запрет ЗПС
+            log.info("Перетаскивание файлов недоступно (%s): используйте кнопку отправки или Ctrl+V", exc)
+            return
+        for widget in (self.chat, self.drop_overlay, self.input, self.msg_entry, self.header, self.list):
             try:
-                self.core.send_file(peer.node_id, path)
-            except (OSError, ValueError) as exc:
-                messagebox.showerror(APP_NAME, f"{os.path.basename(path)}: {exc}")
+                widget.drop_target_register(DND_FILES)  # type: ignore[attr-defined]
+                widget.dnd_bind("<<DropEnter>>", lambda e, w=widget: self._dnd_over(e, w))  # type: ignore
+                widget.dnd_bind("<<DropPosition>>", lambda e, w=widget: self._dnd_over(e, w))  # type: ignore
+                widget.dnd_bind("<<DropLeave>>", lambda e: self._dnd_leave(e))  # type: ignore[attr-defined]
+                widget.dnd_bind("<<Drop>>", lambda e, w=widget: self._dnd_drop(e, w))  # type: ignore
+            except tk.TclError as exc:
+                log.warning("Не удалось включить перетаскивание: %s", exc)
+                return
+        self.dnd_enabled = True
+        log.info("Перетаскивание файлов включено")
+
+    def _drop_target(self, widget: tk.Misc, x_root: int, y_root: int) -> Optional[str]:
+        if widget is self.list:
+            y = self.list.canvasy(y_root - self.list.winfo_rooty())
+            for y0, y1, key in self._row_keys:
+                if y0 <= y < y1:
+                    return key
+            return None
+        return None if self.current == FILES_VIEW else self.current
+
+    def _dnd_over(self, event, widget: tk.Misc):
+        key = self._drop_target(widget, int(getattr(event, "x_root", 0)), int(getattr(event, "y_root", 0)))
+        list_key = key if widget is self.list else None
+        if list_key != self._drop_key:
+            self._drop_key = list_key
+            self._schedule_list()
+        if key != self._overlay_key or not self.drop_overlay.winfo_ismapped():
+            self._overlay_key = key
+            self._show_drop_overlay(key)
+        return getattr(event, "action", "copy") if key else "refuse_drop"
+
+    def _dnd_leave(self, event=None):
+        self.drop_overlay.place_forget()
+        self._overlay_key = "-"
+        if self._drop_key is not None:
+            self._drop_key = None
+            self._schedule_list()
+        return getattr(event, "action", "copy") if event is not None else None
+
+    def _dnd_drop(self, event, widget: tk.Misc):
+        key = self._drop_target(widget, int(getattr(event, "x_root", 0)), int(getattr(event, "y_root", 0)))
+        self._dnd_leave()
+        try:
+            paths = list(self.root.tk.splitlist(event.data))
+        except tk.TclError:
+            paths = [event.data]
+        # Отправку запускаем после возврата из обработчика: источник перетаскивания не ждёт диалогов.
+        self.root.after(10, lambda: self.send_paths(key, paths))
+        return getattr(event, "action", "copy")
+
+    def _show_drop_overlay(self, key: Optional[str]) -> None:
+        cv, f = self.drop_overlay, self.f
+        cv.place(x=0, y=0, relwidth=1, relheight=1)
+        tk.Misc.lift(cv)  # у Canvas метод lift() поднимает элементы холста, а не сам виджет
+        cv.update_idletasks()
+        w, h = max(cv.winfo_width(), 200), max(cv.winfo_height(), 150)
+        cv.delete("all")
+        rounded_rect(cv, 16, 16, w - 16, h - 16, 22, fill="", outline=C.ACCENT, width=2, dash=(10, 6))
+        cx, cy = w / 2, h / 2 - 30
+        cv.create_oval(cx - 34, cy - 34, cx + 34, cy + 34, fill=C.ACCENT, outline="")
+        cv.create_line(cx, cy + 15, cx, cy - 15, fill="#ffffff", width=4, capstyle=tk.ROUND)
+        cv.create_line(cx - 11, cy - 4, cx, cy - 15, cx + 11, cy - 4, fill="#ffffff", width=4, capstyle=tk.ROUND,
+                       joinstyle=tk.ROUND)
+        if key is None:
+            title, sub = "Перетащите файл на собеседника", "в списке чатов слева или откройте личный чат"
+        elif key == ALL_CHAT:
+            n = len(self.core.registry.online())
+            title, sub = "Отпустите, чтобы отправить всем", f"в сети: {n} — перед отправкой спросим подтверждение"
+        else:
+            peer = self.core.registry.get(key)
+            if peer is not None and peer.online:
+                title, sub = "Отпустите, чтобы отправить", tk_safe(peer.nickname)
+            else:
+                title, sub = "Собеседник не в сети", tk_safe(self._name(key))
+        cv.create_text(cx, cy + 60, text=title, font=f.title, fill=C.TEXT)
+        cv.create_text(cx, cy + 88, text=sub, font=f.preview, fill=C.MUTED)
+
+    def _clipboard_files(self) -> list[str]:
+        """Файлы, скопированные в файловом менеджере (Ctrl+C) — X11: text/uri-list и т.п."""
+        for target in ("x-special/gnome-copied-files", "text/uri-list"):
+            try:
+                data = self.root.clipboard_get(type=target)
+            except tk.TclError:
+                continue
+            paths = [_path_from_uri(line.strip()) for line in data.splitlines()
+                     if line.strip().startswith("file://")]
+            if paths:
+                return paths
+        return []
+
+    def _paste(self, _event=None):
+        paths = self._clipboard_files()
+        if not paths:
+            return None  # обычная вставка текста
+        self.send_paths(None if self.current == FILES_VIEW else self.current, paths)
+        return "break"
+
+    def _setup_clipboard_keys(self) -> None:
+        self.msg_entry.bind("<<Paste>>", self._paste)
+
+        def entry_ctrl(event):
+            # Ctrl+V/C/X/A в русской раскладке (Tk получает не «v», а «м»).
+            if event.keysym.lower() in ("v", "c", "x", "a"):
+                return None
+            if event.keycode in _KEYCODES["paste"]:
+                event.widget.event_generate("<<Paste>>")
+            elif event.keycode in _KEYCODES["copy"]:
+                event.widget.event_generate("<<Copy>>")
+            elif event.keycode in _KEYCODES["cut"]:
+                event.widget.event_generate("<<Cut>>")
+            elif event.keycode in _KEYCODES["select_all"]:
+                event.widget.select_range(0, tk.END)
+                event.widget.icursor(tk.END)
+            else:
+                return None
+            return "break"
+
+        for entry in (self.msg_entry, self.search_entry):
+            entry.bind("<Control-KeyPress>", entry_ctrl, add="+")
+
 
     def open_download_dir(self) -> None:
         path = self.core.config.download_path

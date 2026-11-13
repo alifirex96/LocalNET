@@ -404,3 +404,10 @@ def test_bad_magic_is_ignored(tmp_path, pair_factory):
             pass  # или сбросил его — тоже корректно
     assert pair.receiver.all() == []
     assert MAGIC == b"LNF1"
+
+
+def test_path_from_uri():
+    from localnet.utils import path_from_uri
+    assert path_from_uri("file:///home/u/%D0%9E%D1%82%D1%87%D1%91%D1%82%20%D0%B7%D0%B0.xlsx") == "/home/u/Отчёт за.xlsx"
+    assert path_from_uri("file://localhost/tmp/a%20b.txt") == "/tmp/a b.txt"
+    assert path_from_uri("  /tmp/plain path.txt ") == "/tmp/plain path.txt"
