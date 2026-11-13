@@ -19,30 +19,56 @@
 
 ## Быстрый старт
 
-### Готовый exe
+### Linux (в т.ч. Astra Linux) — установка без root
 
-1. **Linux:** скачайте `LocalNET-linux-x86_64` со страницы
-   [Releases](https://github.com/alifirex96/LocalNET/releases) и сделайте его исполняемым:
-   `chmod +x LocalNET-linux-x86_64 && ./LocalNET-linux-x86_64`.
-   **Windows:** `LocalNET.exe` — артефакт CI (*Actions → последний запуск → Artifacts*)
-   либо соберите сами (см. ниже).
-2. Запустите на двух компьютерах одной подсети.
-3. При первом запуске Windows может показать окно брандмауэра — см. раздел
-   [«Брандмауэр»](#брандмауэр).
+1. Скачайте архив со страницы [Releases](https://github.com/alifirex96/LocalNET/releases):
+
+   | Архив | Когда брать |
+   |---|---|
+   | `LocalNET-<версия>-linux-x86_64.tar.gz` | Обычный случай. Готовая программа, Python не нужен. Astra Linux 1.8, Debian 12, Ubuntu 22.04+ и новее |
+   | `LocalNET-<версия>-python.tar.gz` | **Astra Linux с включённой ЗПС** (замкнутой программной средой), другие архитектуры. Работает на системном `python3` 3.8+ (проверено на 3.11–3.13), pyzmq не нужен |
+
+2. Распакуйте и запустите установщик (в терминале или «Выполнить» в файловом менеджере):
+
+   ```bash
+   tar xzf LocalNET-*-linux-x86_64.tar.gz
+   cd LocalNET-*-linux-x86_64
+   ./install.sh
+   ```
+
+   Программа устанавливается в `~/.local/share/localnet`, появляются ярлык в меню
+   приложений («Сеть») и на рабочем столе, команда `localnet`. Установщик сам проверит,
+   что программа запускается, и подскажет, если нет. Удаление: `./install.sh --uninstall`.
+
+3. Без установки тоже можно: `./LocalNET` в распакованной папке (`./localnet.sh` — для python-варианта).
+
+Если программа не запускается из меню, откроется окно с причиной; журнал запуска —
+`~/.config/localnet/logs/launcher.log`. Подробнее — [«Astra Linux»](#astra-linux).
+
+> Не скачивайте отдельный бинарник из артефактов старых сборок CI: ZIP-архив GitHub
+> теряет право на исполнение, а сборки до v0.2.0 требовали glibc 2.38+.
+
+### Windows
+
+`LocalNET.exe` — артефакт CI (*Actions → последний запуск → Artifacts → LocalNET-Windows*)
+либо соберите сами (см. «Сборка»). При первом запуске Windows может показать окно
+брандмауэра — см. [«Брандмауэр»](#брандмауэр).
 
 ### Из исходников
 
 ```bash
 git clone https://github.com/alifirex96/LocalNET.git
 cd LocalNET
-python -m pip install --user -r requirements.txt   # только pyzmq
-python -m localnet            # GUI
-python -m localnet --cli      # консольный режим
+python3 -m pip install --user -r requirements.txt   # pyzmq — необязательно, см. ниже
+python3 -m localnet            # GUI
+python3 -m localnet --cli      # консольный режим
 ```
 
-На Linux для GUI нужен tkinter: `sudo apt install python3-tk` (Debian/Ubuntu) или
+На Linux для GUI нужен tkinter: `sudo apt install python3-tk` (Debian/Ubuntu/Astra) или
 `sudo dnf install python3-tkinter` (Fedora). Без него работает `--cli`.
-Без прав root можно использовать готовый бинарник — в нём tkinter уже есть.
+
+**pyzmq необязателен.** Без него используется встроенная реализация протокола ZeroMQ
+на чистом Python — она полностью совместима: узлы с pyzmq и без него общаются друг с другом.
 
 ### Как пользоваться (GUI)
 
@@ -97,7 +123,8 @@ python -m localnet --cli [--nickname Вася] [--auto-accept]
   "auto_accept": false,
   "announce_interval": 1.0,
   "peer_timeout": 6.0,
-  "log_level": "INFO"
+  "log_level": "INFO",
+  "transport": "auto"
 }
 ```
 
@@ -113,6 +140,7 @@ python -m localnet --cli [--nickname Вася] [--auto-accept]
 | `secret` | Общий секрет (HMAC-SHA256). Узлы с разными секретами не видят друг друга и не принимают сообщения/файлы. Пусто — без проверки. |
 | `download_dir` | Папка входящих файлов. Пусто — `~/Downloads/LocalNET`. |
 | `auto_accept` | Принимать файлы без вопроса. |
+| `transport` | Транспорт сообщений: `auto` (pyzmq, если есть, иначе чистый Python), `zmq`, `python`. Совместимы между собой. |
 
 ### Как поменять порт
 
@@ -172,16 +200,47 @@ sudo firewall-cmd --permanent --add-port=45892/udp --add-port=45893-45894/tcp &&
 
 ---
 
+## Astra Linux
+
+Проверено на совместимость с Astra Linux SE 1.8 (glibc 2.36, Python 3.11) по
+характеристикам системы; на живой Astra программа не запускалась — сообщите о проблемах.
+
+**Почему могла «ничего не происходить» при открытии.** Возможные причины:
+
+* бинарник собран на новой системе и требует glibc новее, чем в Astra — начиная с v0.2.0
+  Linux-сборка делается на Ubuntu 22.04 (glibc 2.35), и CI проверяет это автоматически;
+* файл без права на исполнение (так бывает после скачивания) — `install.sh` выставляет права
+  и создаёт ярлык;
+* `/tmp` смонтирован с `noexec`, а однофайловая сборка PyInstaller распаковывает туда
+  библиотеки — Linux-сборка теперь «папкой», без распаковки;
+* **включена замкнутая программная среда (ЗПС)**: неподписанные ELF-файлы и библиотеки
+  `.so` не запускаются. Установщик это определяет и предупреждает.
+
+**При включённой ЗПС** используйте архив `LocalNET-<версия>-python.tar.gz`. Он запускается
+подписанным системным интерпретатором `python3` и не содержит бинарных модулей: протокол
+ZeroMQ реализован на чистом Python (`localnet/zmtp.py`). Нужен только пакет `python3-tk`
+из репозитория Astra (обычно уже установлен; если нет — администратор:
+`sudo apt install python3-tk`). Без него работает консольный режим `localnet --cli`.
+
+Альтернатива для администратора — подписать собранную программу своим ключом
+(`bsign`) и добавить ключ в доверенные; это делается по документации Astra Linux.
+
+Если включён запрет интерпретаторов (`astra-interpreters-lock`), python-вариант тоже
+не запустится — нужна подписанная сборка или разрешение администратора.
+
 ## Сборка исполняемого файла
 
 ```bash
 python -m pip install -r requirements-dev.txt
-pyinstaller --clean --noconfirm build.spec
+pyinstaller --clean --noconfirm build.spec                    # Windows: один файл dist/LocalNET.exe
+LOCALNET_ONEDIR=1 pyinstaller --clean --noconfirm build.spec  # Linux: папка dist/LocalNET/
+sh packaging/linux/make-release.sh v0.2.0 dist/LocalNET out   # Linux: архивы с install.sh
+sh packaging/linux/check-glibc.sh dist/LocalNET 2.35          # проверка совместимости glibc
 ```
 
-Результат — `dist/LocalNET.exe` (Windows, ~15 МБ) или `dist/LocalNET` (Linux).
-Это один файл без установки; его можно положить на флешку вместе с `localnet.json`.
 Собирать нужно на той ОС, для которой нужен бинарник (PyInstaller не кросс-компилирует).
+Для Linux собирайте на **самой старой** системе, на которой программа должна работать:
+бинарник требует glibc не ниже, чем на машине сборки.
 
 Отладочная сборка с консолью (нужна для `--cli` на Windows):
 
@@ -189,17 +248,18 @@ pyinstaller --clean --noconfirm build.spec
 $env:LOCALNET_CONSOLE = "1"; pyinstaller --clean --noconfirm build.spec   # → dist/LocalNET-console.exe
 ```
 
-CI (GitHub Actions) гоняет тесты на Windows и Linux (Python 3.10 и 3.12) и собирает
-оба бинарника как артефакты.
+CI (GitHub Actions) гоняет тесты на Windows и Linux (Python 3.10 и 3.12), отдельно — на
+системном Python Ubuntu 22.04 без pyzmq, и собирает Windows-exe и Linux-архивы.
 
 ### Выпуск релиза
 
-Пуш тега вида `v*` запускает `.github/workflows/release.yml`: тесты, сборка Linux-бинарника
-на Ubuntu 22.04 (glibc 2.35 — совместим с большинством современных дистрибутивов),
-проверка запуска CLI и GUI, публикация в GitHub Releases вместе с `SHA256SUMS.txt`:
+Пуш тега вида `v*` (или *Actions → Release → Run workflow*) запускает
+`.github/workflows/release.yml`: тесты, сборка на Ubuntu 22.04, проверка glibc ≤ 2.35,
+упаковка обоих Linux-архивов, установка `install.sh` в чистый профиль и запуск GUI/CLI,
+публикация в GitHub Releases вместе с `SHA256SUMS.txt`:
 
 ```bash
-git tag v0.1.1 && git push origin v0.1.1
+git tag v0.2.0 && git push origin v0.2.0
 ```
 
 ---
@@ -215,7 +275,8 @@ python -m pytest -v
 |---|---|
 | `tests/test_discovery.py` | разбор/валидация presence-пакетов, подписи и защита от повтора, таблица пиров (offline, забывание, перезапуск узла) |
 | `tests/test_file_transfer.py` | потоковый SHA-256, безопасные имена файлов, кадрирование, chunked- и sendfile-передача с offset, полный протокол на loopback: успех, пустой файл, коллизия имён, отказ, неверный секрет, отмена отправителем и получателем, **докачка**, обнаружение повреждения |
-| `tests/test_messaging.py` | личные и общие сообщения через ZeroMQ, подтверждения, неизвестный пир, неверный секрет |
+| `tests/test_messaging.py` | личные и общие сообщения, подтверждения, неизвестный пир, неверный секрет — для всех сочетаний транспортов (pyzmq ↔ чистый Python), heartbeat libzmq, переподключение |
+| `tests/test_zmtp.py` | кодек ZMTP 3.0: приветствие, кадры, READY, PING/PONG, несовместимые сокеты, лимиты |
 | `tests/test_config.py` | создание/сохранение настроек, исправление некорректных значений, UTF-8 с BOM, повреждённый файл не перезаписывается |
 
 Ручная проверка на одной машине — два экземпляра с разными портами и конфигами:
@@ -235,7 +296,8 @@ localnet/
   app.py            LocalNetCore — связывает компоненты, очередь событий для UI, логирование
   config.py         настройки JSON (portable / профиль пользователя)
   discovery.py      UDP broadcast/multicast, разбор пакетов, таблица пиров
-  messaging.py      чат поверх ZeroMQ ROUTER/DEALER с подтверждениями
+  messaging.py      чат по протоколу ZeroMQ ROUTER/DEALER с подтверждениями (pyzmq или чистый Python)
+  zmtp.py           реализация ZMTP 3.0 на чистом Python (без бинарных зависимостей)
   file_transfer.py  TCP-сервер/клиент файлов, sendfile/chunked, SHA-256, докачка
   gui.py            tkinter
   cli.py            консольный интерфейс
@@ -278,6 +340,11 @@ IP пира берётся из адреса отправителя пакета
   LAN-масштаба (десятки–сотни узлов) это дёшево и даёт подтверждения от каждого.
 * Защита: `MAXMSGSIZE` 256 КБ, проверка `identity == from` (нельзя подделать отправителя),
   дедупликация по `msg_id`, ZMTP-heartbeat для обнаружения «мёртвых» соединений.
+* **Два транспорта, один протокол.** Если установлен pyzmq — используется он (libzmq).
+  Если нет (или бинарные модули запрещены, как в Astra Linux с ЗПС) — `localnet/zmtp.py`:
+  собственная реализация ZMTP 3.0 (механизм NULL, ROUTER/DEALER, PING/PONG) на чистом
+  Python. Узлы с разными транспортами совместимы «по проводу» — это проверяется тестами.
+  Принудительно выбрать: `"transport": "python"` в настройках или `--transport python`.
 
 ### Файлы
 
@@ -326,6 +393,9 @@ IP пира берётся из адреса отправителя пакета
 * Без шифрования трафика: секрет даёт аутентификацию (HMAC), но не конфиденциальность.
   Для LAN этого обычно достаточно; шифрование (CurveZMQ / TLS) — в планах.
 * История чата хранится только в памяти до закрытия программы.
+* Linux-сборка — только x86_64; для других архитектур (например, Эльбрус, ARM) —
+  python-вариант.
+* На реальной Astra Linux программа не проверялась (только совместимость по glibc/Python).
 * Передача папок целиком пока не поддерживается (можно выбрать несколько файлов).
 * Получатель хеширует данные в том же потоке, что и пишет на диск; на 10 GbE это может
   стать узким местом (~1,5–2 ГБ/с SHA-256 на современных CPU).
