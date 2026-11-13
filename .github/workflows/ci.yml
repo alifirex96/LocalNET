@@ -20,13 +20,28 @@ jobs:
       - run: python -m pip install -r requirements.txt pytest
       - run: python -m pytest -v
 
+  # Как на Astra Linux с ЗПС: системный python3 без pyzmq — работает транспорт на чистом Python.
+  test-no-pyzmq:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -q && sudo apt-get install -y -q python3-pytest
+      - run: /usr/bin/python3 -c "import zmq" 2>/dev/null && echo "pyzmq есть" || echo "pyzmq нет — тесты идут на транспорте Python"
+      - run: /usr/bin/python3 -m pytest -v
+
   build-exe:
-    needs: test
+    needs: [test, test-no-pyzmq]
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        include:
+          - os: ubuntu-22.04   # старая glibc 2.35 — совместимо с Astra 1.8, Debian 12, Ubuntu 22.04+
+            onedir: "1"
+          - os: windows-latest
+            onedir: ""
     runs-on: ${{ matrix.os }}
+    env:
+      LOCALNET_ONEDIR: ${{ matrix.onedir }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -34,7 +49,18 @@ jobs:
           python-version: "3.12"
       - run: python -m pip install -r requirements-dev.txt
       - run: pyinstaller --clean --noconfirm build.spec
+      - name: Упаковка Linux (tar.gz сохраняет права на исполнение)
+        if: runner.os == 'Linux'
+        run: |
+          sh packaging/linux/check-glibc.sh dist/LocalNET 2.35
+          sh packaging/linux/make-release.sh "ci-${GITHUB_SHA::7}" dist/LocalNET out
       - uses: actions/upload-artifact@v4
+        if: runner.os == 'Linux'
         with:
-          name: LocalNET-${{ runner.os }}
+          name: LocalNET-Linux
+          path: out/*
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: LocalNET-Windows
           path: dist/*
