@@ -169,3 +169,33 @@ def test_python_transport_reconnects_after_peer_restart():
         b2.m.stop()
     finally:
         a.m.stop()
+
+
+def test_read_receipts_and_reactions(nodes):
+    a, b = nodes("a" * 32, "Алиса"), nodes("b" * 32, "Боб")
+    reads, reactions = [], []
+    a.m.on_read = lambda peer, ids: reads.append((peer, ids))
+    a.m.on_reaction = lambda mid, peer, code: reactions.append((mid, peer, code))
+    a.know(b)
+    b.know(a)
+    msg = a.m.send("прочитай меня", to=b.m.node_id)
+    assert wait_for(lambda: b.inbox)
+    b.m.send_read(a.m.node_id, [msg.msg_id])
+    b.m.send_reaction(msg.msg_id, "like", [a.m.node_id])
+    b.m.send_reaction(msg.msg_id, "", [a.m.node_id])
+    assert wait_for(lambda: reads and len(reactions) == 2)
+    assert reads == [(b.m.node_id, [msg.msg_id])]
+    assert reactions == [(msg.msg_id, b.m.node_id, "like"), (msg.msg_id, b.m.node_id, "")]
+    assert b.inbox[0].text == "прочитай меня" and len(b.inbox) == 1
+
+
+def test_bad_reaction_rejected():
+    from localnet.messaging import decode_frame
+    from localnet.utils import canonical_json
+    base = {"proto": 1, "type": "react", "id": "x" * 32, "from": "f" * 32, "msg": "m" * 32}
+    assert decode_frame(canonical_json({**base, "code": "like"}), "") is not None
+    assert decode_frame(canonical_json({**base, "code": "<script>"}), "") is None
+    read = {"proto": 1, "type": "read", "id": "x" * 32, "from": "f" * 32}
+    assert decode_frame(canonical_json({**read, "ids": []}), "") is None
+    assert decode_frame(canonical_json({**read, "ids": ["a" * 65]}), "") is None
+    assert decode_frame(canonical_json({**read, "ids": ["a" * 32]}), "") is not None

@@ -9,6 +9,7 @@
     /transfers            — список передач
     /cancel <id>          — отменить передачу (достаточно начала id)
     /accept <id> | /decline <id> — решение по входящему файлу
+    /react [like|ok|star|smile|sad] — реакция на последнее полученное сообщение
     /nick <новый ник>     — сменить ник
     /help, /quit
 """
@@ -23,7 +24,7 @@ import time
 from datetime import datetime
 
 from .app import LocalNetCore
-from .models import EventType, FileOffer, TransferState
+from .models import REACTIONS, EventType, FileOffer, TransferState
 from .utils import human_size, human_speed
 
 
@@ -33,6 +34,7 @@ class CliApp:
         self.offers: dict[str, FileOffer] = {}
         self._stop = threading.Event()
         self._last_progress: dict[str, float] = {}
+        self.last_received = None
 
     def run(self) -> int:
         self.core.start()
@@ -97,6 +99,15 @@ class CliApp:
                     print("Нет такого предложения")
                 else:
                     offer.resolve(cmd == "/accept")
+            elif cmd == "/react":
+                code = args[0] if args else "like"
+                if self.last_received is None:
+                    print("Нет полученных сообщений")
+                elif code not in REACTIONS:
+                    print("Реакции: " + ", ".join(REACTIONS))
+                else:
+                    self.core.react(self.last_received.msg_id, code)
+                    print(f"Реакция {REACTIONS[code]} отправлена")
             elif cmd == "/nick" and args:
                 self.core.set_nickname(" ".join(args))
                 print(f"Ник изменён: {self.core.get_nickname()}")
@@ -149,6 +160,16 @@ class CliApp:
             elif ev.type == EventType.MESSAGE:
                 kind = "ЛС " if d.is_private else ""
                 print(f"[{ts}] {kind}<{d.sender_nick}> {d.text}")
+                self.last_received = d
+                # Сообщение показано в терминале — считаем прочитанным.
+                self.core.mark_read(self.core.history.conv_of(d))
+            elif ev.type == EventType.MESSAGE_READ:
+                names = self.core.registry.get(d[0])
+                print(f"[{ts}] ✓✓ прочитано: {names.nickname if names else d[0][:8]}")
+            elif ev.type == EventType.REACTION:
+                peer = self.core.registry.get(d[1])
+                if d[2]:
+                    print(f"[{ts}] {peer.nickname if peer else d[1][:8]} отреагировал(а) {REACTIONS.get(d[2], '')}")
             elif ev.type == EventType.MESSAGE_FAILED:
                 peer = self.core.registry.get(d[1])
                 print(f"[{ts}] ! сообщение не доставлено: {peer.nickname if peer else d[1][:8]}")

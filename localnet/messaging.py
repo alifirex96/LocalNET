@@ -34,7 +34,7 @@ from typing import Callable, Optional
 
 from . import PROTOCOL_VERSION
 from .discovery import PeerRegistry
-from .models import ChatMessage, Peer, new_id
+from .models import REACTIONS, ChatMessage, Peer, new_id
 from .utils import canonical_json, sign, verify
 from .zmtp import ZmtpConnection, ZmtpError
 
@@ -46,6 +46,7 @@ except Exception:  # noqa: BLE001 - ImportError или ошибка загруз
 log = logging.getLogger(__name__)
 
 MAX_TEXT = 16 * 1024            # максимальная длина текста сообщения (символов)
+MAX_READ_IDS = 500              # максимум id в одной отметке «прочитано»
 MAX_WIRE_MESSAGE = 256 * 1024   # жёсткий лимит размера кадра (защита памяти)
 ACK_TIMEOUT = 8.0               # сек. ожидания подтверждения доставки
 POLL_MS = 50
@@ -91,7 +92,7 @@ def decode_frame(data: bytes, secret: str) -> Optional[dict]:
         return None
     if not isinstance(obj, dict) or obj.get("proto") != PROTOCOL_VERSION:
         return None
-    if obj.get("type") not in ("chat", "ack"):
+    if obj.get("type") not in ("chat", "ack", "read", "react"):
         return None
     if not isinstance(obj.get("id"), str) or not isinstance(obj.get("from"), str):
         return None
@@ -101,6 +102,18 @@ def decode_frame(data: bytes, secret: str) -> Optional[dict]:
         if obj.get("to") is not None and not isinstance(obj.get("to"), str):
             return None
         if not isinstance(obj.get("ts"), (int, float)):
+            return None
+    elif obj["type"] == "read":
+        ids = obj.get("ids")
+        if (not isinstance(ids, list) or not 0 < len(ids) <= MAX_READ_IDS
+                or not all(isinstance(i, str) and 0 < len(i) <= 64 for i in ids)):
+            return None
+    elif obj["type"] == "react":
+        code = obj.get("code")
+        msg = obj.get("msg")
+        if not isinstance(msg, str) or not 0 < len(msg) <= 64:
+            return None
+        if not isinstance(code, str) or (code and code not in REACTIONS):
             return None
     if not verify(obj, secret):
         return None
@@ -139,6 +152,8 @@ class BaseMessenger:
         on_message: Optional[Callable[[ChatMessage], None]] = None,
         on_delivered: Optional[Callable[[str, str], None]] = None,
         on_failed: Optional[Callable[[str, str], None]] = None,
+        on_read: Optional[Callable[[str, list], None]] = None,
+        on_reaction: Optional[Callable[[str, str, str], None]] = None,
     ) -> None:
         self.node_id = node_id
         self.get_nickname = get_nickname
@@ -149,6 +164,8 @@ class BaseMessenger:
         self.on_message = on_message
         self.on_delivered = on_delivered  # (msg_id, peer_id)
         self.on_failed = on_failed        # (msg_id, peer_id)
+        self.on_read = on_read            # (peer_id, [msg_id])
+        self.on_reaction = on_reaction    # (msg_id, peer_id, code)
 
         self._lock = threading.Lock()
         self._pending: dict[tuple[str, str], _Pending] = {}
@@ -187,6 +204,32 @@ class BaseMessenger:
     def _submit(self, msg: ChatMessage) -> None:  # pragma: no cover - переопределяется
         raise NotImplementedError
 
+    def _submit_raw(self, peer_ids: list[str], payload: bytes) -> None:  # pragma: no cover
+        raise NotImplementedError
+
+    def send_read(self, peer_id: str, msg_ids: list[str]) -> None:
+        """Отметка «прочитано» отправителю сообщений (без подтверждения доставки)."""
+        for i in range(0, len(msg_ids), MAX_READ_IDS):
+            obj = {"proto": PROTOCOL_VERSION, "type": "read", "id": new_id(), "from": self.node_id,
+                   "ids": list(msg_ids[i:i + MAX_READ_IDS])}
+            obj["sig"] = sign(obj, self.secret)
+            self._submit_raw([peer_id], canonical_json(obj))
+
+    def send_reaction(self, msg_id: str, code: str, peer_ids: list[str]) -> None:
+        """Реакция на сообщение (``code=""`` — снять реакцию) — всем участникам чата."""
+        if code and code not in REACTIONS:
+            raise ValueError(f"Неизвестная реакция {code!r}")
+        obj = {"proto": PROTOCOL_VERSION, "type": "react", "id": new_id(), "from": self.node_id,
+               "msg": msg_id, "code": code}
+        obj["sig"] = sign(obj, self.secret)
+        self._submit_raw(list(peer_ids), canonical_json(obj))
+
+    def _send_raw_now(self, peer_ids: list[str], payload: bytes) -> None:
+        for pid in peer_ids:
+            peer = self.registry.get(pid)
+            if peer is not None and peer.online:
+                self._transport_send(peer, payload)
+
     def _transport_send(self, peer: Peer, payload: bytes) -> bool:  # pragma: no cover
         raise NotImplementedError
 
@@ -219,12 +262,18 @@ class BaseMessenger:
     def _handle_incoming(self, identity: bytes, data: bytes) -> Optional[bytes]:
         """Обрабатывает входящий кадр; возвращает ack для отправки или None."""
         obj = decode_frame(data, self.secret)
-        if obj is None or obj["type"] != "chat":
+        if obj is None or obj["type"] == "ack":
             log.debug("Отброшен некорректный кадр от %r", identity[:32])
             return None
         # identity DEALER'а = node_id отправителя: сверяем, чтобы нельзя было подделать поле from.
         if identity.decode("ascii", "replace") != obj["from"]:
             log.debug("identity не совпадает с полем from — отброшено")
+            return None
+        if obj["type"] == "read":
+            self._call(self.on_read, obj["from"], obj["ids"])
+            return None
+        if obj["type"] == "react":
+            self._call(self.on_reaction, obj["msg"], obj["from"], obj["code"])
             return None
         ack = {"proto": PROTOCOL_VERSION, "type": "ack", "id": obj["id"], "from": self.node_id}
         ack["sig"] = sign(ack, self.secret)
@@ -278,6 +327,15 @@ class BaseMessenger:
         for msg_id, peer_id in expired:
             log.info("Сообщение %s не подтверждено пиром %s", msg_id[:8], peer_id[:8])
             self._emit(self.on_failed, msg_id, peer_id)
+
+    @staticmethod
+    def _call(cb: Optional[Callable], *args) -> None:
+        if cb is None:
+            return
+        try:
+            cb(*args)
+        except Exception:  # noqa: BLE001
+            log.exception("Ошибка обработчика")
 
     @staticmethod
     def _emit(cb: Optional[Callable[[str, str], None]], msg_id: str, peer_id: str) -> None:
@@ -342,6 +400,9 @@ class ZmqMessenger(BaseMessenger):
     def _submit(self, msg: ChatMessage) -> None:
         self._commands.put(("send", msg))
 
+    def _submit_raw(self, peer_ids: list[str], payload: bytes) -> None:
+        self._commands.put(("raw", peer_ids, payload))
+
     def _run(self) -> None:
         self._poller = zmq.Poller()
         self._poller.register(self._router, zmq.POLLIN)
@@ -371,6 +432,8 @@ class ZmqMessenger(BaseMessenger):
             try:
                 if cmd[0] == "send":
                     self._do_send(cmd[1])
+                elif cmd[0] == "raw":
+                    self._send_raw_now(cmd[1], cmd[2])
                 elif cmd[0] == "forget":
                     self._close_dealer(cmd[1])
             except Exception:  # noqa: BLE001
@@ -589,6 +652,9 @@ class PyMessenger(BaseMessenger):
             self._do_send(msg)
         except Exception:  # noqa: BLE001
             log.exception("Ошибка отправки сообщения")
+
+    def _submit_raw(self, peer_ids: list[str], payload: bytes) -> None:
+        self._send_raw_now(peer_ids, payload)
 
     def _transport_send(self, peer: Peer, payload: bytes) -> bool:
         with self._links_lock:
