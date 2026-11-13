@@ -7,7 +7,7 @@ import logging.handlers
 import queue
 import sys
 import threading
-import uuid
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -15,8 +15,9 @@ from . import APP_NAME, __version__
 from .config import Config
 from .discovery import Discovery, PeerRegistry
 from .file_transfer import ACCEPT_TIMEOUT, FileTransferManager
+from .history import HistoryStore, history_path_for
 from .messaging import Messenger
-from .models import AppEvent, ChatMessage, EventType, FileOffer, Peer, Transfer
+from .models import ALL_CHAT, REACTIONS, AppEvent, ChatMessage, EventType, FileOffer, Peer, Transfer
 from .utils import guess_local_ip, user_config_dir
 
 log = logging.getLogger(__name__)
@@ -55,7 +56,10 @@ class LocalNetCore:
 
     def __init__(self, config: Config) -> None:
         self.config = config
-        self.node_id = uuid.uuid4().hex
+        # История и постоянный ID узла (чтобы после перезапуска переписка продолжалась).
+        self.history = HistoryStore(history_path_for(config.path), enabled=config.save_history)
+        self.node_id = self.history.node_id()
+        self._saved_transfer_state: dict[str, str] = {}
         self.events: "queue.Queue[AppEvent]" = queue.Queue()
         self.registry = PeerRegistry()
         self.local_ip = guess_local_ip()
@@ -69,9 +73,11 @@ class LocalNetCore:
             registry=self.registry,
             port=config.msg_port,
             secret=config.secret,
-            on_message=lambda m: self._emit(EventType.MESSAGE, m),
-            on_delivered=lambda mid, pid: self._emit(EventType.MESSAGE_DELIVERED, (mid, pid)),
-            on_failed=lambda mid, pid: self._emit(EventType.MESSAGE_FAILED, (mid, pid)),
+            on_message=self._on_message,
+            on_delivered=lambda mid, pid: self._on_receipt(mid, pid, "delivered", EventType.MESSAGE_DELIVERED),
+            on_failed=lambda mid, pid: self._on_receipt(mid, pid, "failed", EventType.MESSAGE_FAILED),
+            on_read=self._on_read,
+            on_reaction=self._on_reaction,
             transport=config.transport,
         )
         self.files = FileTransferManager(
@@ -80,7 +86,7 @@ class LocalNetCore:
             port=config.file_port,
             get_download_dir=lambda: self.config.download_path,
             secret=config.secret,
-            on_update=lambda t: self._emit(EventType.TRANSFER_UPDATED, t),
+            on_update=self._on_transfer,
             on_offer=self._on_offer,
             resolve_peer=self._resolve_peer,
         )
@@ -107,7 +113,7 @@ class LocalNetCore:
             secret=self.config.secret,
             interval=self.config.announce_interval,
             timeout=self.config.peer_timeout,
-            on_peer_updated=lambda p: self._emit(EventType.PEER_UPDATED, p),
+            on_peer_updated=self._on_peer_updated,
             on_peer_offline=self._on_peer_offline,
             on_peer_removed=lambda p: self._emit(EventType.PEER_REMOVED, p),
         )
@@ -130,6 +136,10 @@ class LocalNetCore:
             self.discovery.stop()
         self.files.stop()
         self.messenger.stop()
+        now = time.time()
+        for peer in self.registry.online():
+            self.history.upsert_contact(peer.node_id, peer.nickname, peer.ip, now)
+        self.history.close()
         log.info("Остановлено")
 
     # ------------------------------------------------------------------ #
@@ -160,7 +170,36 @@ class LocalNetCore:
             log.warning("Не удалось сохранить настройки: %s", exc)
 
     def send_message(self, text: str, to: Optional[str] = None) -> ChatMessage:
-        return self.messenger.send(text, to)
+        targets = len(self.registry.online()) if to is None else 1
+        msg = self.messenger.send(text, to)
+        self.history.add_message(msg, targets)
+        return msg
+
+    def mark_read(self, conv: str) -> list[str]:
+        """Отметить входящие сообщения чата прочитанными и сообщить об этом отправителям."""
+        unread = self.history.unread(conv)
+        if not unread:
+            return []
+        by_sender: dict[str, list[str]] = {}
+        for msg_id, sender in unread:
+            by_sender.setdefault(sender, []).append(msg_id)
+        for sender, ids in by_sender.items():
+            self.messenger.send_read(sender, ids)
+        ids = [m for m, _ in unread]
+        self.history.mark_read_sent(ids)
+        return ids
+
+    def react(self, msg_id: str, code: str, conv: Optional[str] = None) -> None:
+        """Поставить (или снять, ``code=""``) свою реакцию на сообщение."""
+        if code and code not in REACTIONS:
+            raise ValueError(f"Неизвестная реакция {code!r}")
+        conv = conv or self.history.message_conv(msg_id) or ALL_CHAT
+        self.history.set_reaction(msg_id, self.node_id, code)
+        if conv == ALL_CHAT:
+            targets = [p.node_id for p in self.registry.online()]
+        else:
+            targets = [conv]
+        self.messenger.send_reaction(msg_id, code, targets)
 
     def send_file(self, peer_id: str, path: str) -> Transfer:
         peer = self.registry.get(peer_id)
@@ -180,7 +219,36 @@ class LocalNetCore:
 
     def _on_peer_offline(self, peer: Peer) -> None:
         self.messenger.forget_peer(peer.node_id)
+        self.history.upsert_contact(peer.node_id, peer.nickname, peer.ip, peer.last_seen)
         self._emit(EventType.PEER_OFFLINE, peer)
+
+    def _on_peer_updated(self, peer: Peer) -> None:
+        self.history.upsert_contact(peer.node_id, peer.nickname, peer.ip, peer.last_seen)
+        self._emit(EventType.PEER_UPDATED, peer)
+
+    def _on_message(self, msg: ChatMessage) -> None:
+        self.history.add_message(msg)
+        self._emit(EventType.MESSAGE, msg)
+
+    def _on_receipt(self, msg_id: str, peer_id: str, kind: str, etype: EventType) -> None:
+        self.history.add_receipt(msg_id, peer_id, kind)
+        self._emit(etype, (msg_id, peer_id))
+
+    def _on_read(self, peer_id: str, msg_ids: list) -> None:
+        for msg_id in msg_ids:
+            self.history.add_receipt(msg_id, peer_id, "read")
+        self._emit(EventType.MESSAGE_READ, (peer_id, list(msg_ids)))
+
+    def _on_reaction(self, msg_id: str, peer_id: str, code: str) -> None:
+        self.history.set_reaction(msg_id, peer_id, code)
+        self._emit(EventType.REACTION, (msg_id, peer_id, code))
+
+    def _on_transfer(self, t: Transfer) -> None:
+        # В историю — только смена состояния (не каждый шаг прогресса).
+        if self._saved_transfer_state.get(t.transfer_id) != t.state.name:
+            self._saved_transfer_state[t.transfer_id] = t.state.name
+            self.history.upsert_transfer(t)
+        self._emit(EventType.TRANSFER_UPDATED, t)
 
     def _resolve_peer(self, node_id: str, ip: str) -> tuple[str, str]:
         peer = self.registry.get(node_id)

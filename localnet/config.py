@@ -72,6 +72,10 @@ class Config:
     # Транспорт сообщений: auto (pyzmq, если доступен, иначе чистый Python), zmq, python.
     # Оба транспорта совместимы по протоколу.
     transport: str = "auto"
+    # Сохранять историю переписки на диске (файл <имя конфига>.history.db рядом с настройками).
+    save_history: bool = True
+    # Свои сообщения справа (по умолчанию все сообщения слева, свои — зелёные).
+    own_messages_right: bool = False
 
     # Путь, откуда загружен конфиг (не сохраняется в файл).
     path: Optional[str] = field(default=None, repr=False, compare=False)

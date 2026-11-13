@@ -10,6 +10,20 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 
+# Ключ общего чата (личные чаты адресуются node_id собеседника).
+ALL_CHAT = "__all__"
+
+# Реакции: код в протоколе → символ. Только символы из базовой плоскости Unicode:
+# цветные эмодзи в Tk на X11 могут обрушить программу (ошибка Xft BadLength).
+REACTIONS = {
+    "like": "♥",
+    "ok": "✔",
+    "star": "★",
+    "smile": "☺",
+    "sad": "☹",
+}
+
+
 def new_id() -> str:
     return uuid.uuid4().hex
 
@@ -158,6 +172,8 @@ class EventType(str, enum.Enum):
     MESSAGE = "message"
     MESSAGE_DELIVERED = "message_delivered"
     MESSAGE_FAILED = "message_failed"
+    MESSAGE_READ = "message_read"      # (peer_id, [msg_id, ...])
+    REACTION = "reaction"              # (msg_id, peer_id, code или "")
     TRANSFER_UPDATED = "transfer_updated"
     FILE_OFFER = "file_offer"
     INFO = "info"
