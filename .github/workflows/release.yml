@@ -1,0 +1,80 @@
+name: Release
+
+# Публикация релиза: git tag v0.1.0 && git push origin v0.1.0
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Тег релиза (например, v0.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    # Самый старый доступный раннер — бинарник собирается со старой glibc (2.35)
+    # и поэтому запускается на большем числе дистрибутивов.
+    runs-on: ubuntu-22.04
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Зависимости
+        run: python -m pip install -r requirements-dev.txt
+      - name: Тесты
+        run: python -m pytest -q
+      - name: Сборка
+        run: pyinstaller --clean --noconfirm build.spec
+      - name: Проверка бинарника (версия, CLI, GUI под Xvfb)
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q xvfb
+          ./dist/LocalNET --version
+          export XDG_CONFIG_HOME="$RUNNER_TEMP/cfg"
+          echo /quit | timeout 10 ./dist/LocalNET --cli --config "$RUNNER_TEMP/cli.json"
+          set +e
+          timeout 8 xvfb-run -a ./dist/LocalNET --config "$RUNNER_TEMP/gui.json"
+          code=$?
+          set -e
+          # 124 — окно работало до таймаута, т.е. GUI (tkinter) запустился.
+          test "$code" -eq 124
+      - name: Упаковка
+        run: |
+          NAME="LocalNET-${TAG}-linux-x86_64"
+          mkdir -p "release/$NAME"
+          cp dist/LocalNET "release/$NAME/LocalNET"
+          cp README.md LICENSE "release/$NAME/"
+          tar -C release -czf "$NAME.tar.gz" "$NAME"
+          cp dist/LocalNET "LocalNET-linux-x86_64"
+          sha256sum "$NAME.tar.gz" LocalNET-linux-x86_64 > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - name: Публикация релиза
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > notes.md <<NOTES
+          ## LocalNET ${TAG} для Linux (x86_64)
+
+          Один исполняемый файл: без установки, без Python, без прав root.
+
+          \`\`\`bash
+          chmod +x LocalNET-linux-x86_64
+          ./LocalNET-linux-x86_64          # GUI
+          ./LocalNET-linux-x86_64 --cli    # консольный режим
+          \`\`\`
+
+          Или архив \`LocalNET-${TAG}-linux-x86_64.tar.gz\` (бинарник + README + LICENSE).
+          Собран на Ubuntu 22.04 (glibc 2.35) — работает на Ubuntu 22.04+, Debian 12+, Fedora 36+, Mint 21+ и новее.
+          Контрольные суммы — в \`SHA256SUMS.txt\`. Подробности — в README.
+          NOTES
+          FILES="LocalNET-${TAG}-linux-x86_64.tar.gz LocalNET-linux-x86_64 SHA256SUMS.txt"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" $FILES --clobber
+          else
+            gh release create "$TAG" $FILES --title "LocalNET $TAG" --notes-file notes.md --target "$GITHUB_SHA"
+          fi

@@ -21,8 +21,11 @@
 
 ### Готовый exe
 
-1. Скачайте `LocalNET.exe` (Windows) или `LocalNET` (Linux) — артефакты CI
-   (вкладка *Actions → последний запуск → Artifacts*) либо соберите сами (см. ниже).
+1. **Linux:** скачайте `LocalNET-linux-x86_64` со страницы
+   [Releases](https://github.com/alifirex96/LocalNET/releases) и сделайте его исполняемым:
+   `chmod +x LocalNET-linux-x86_64 && ./LocalNET-linux-x86_64`.
+   **Windows:** `LocalNET.exe` — артефакт CI (*Actions → последний запуск → Artifacts*)
+   либо соберите сами (см. ниже).
 2. Запустите на двух компьютерах одной подсети.
 3. При первом запуске Windows может показать окно брандмауэра — см. раздел
    [«Брандмауэр»](#брандмауэр).
@@ -188,6 +191,16 @@ $env:LOCALNET_CONSOLE = "1"; pyinstaller --clean --noconfirm build.spec   # → 
 
 CI (GitHub Actions) гоняет тесты на Windows и Linux (Python 3.10 и 3.12) и собирает
 оба бинарника как артефакты.
+
+### Выпуск релиза
+
+Пуш тега вида `v*` запускает `.github/workflows/release.yml`: тесты, сборка Linux-бинарника
+на Ubuntu 22.04 (glibc 2.35 — совместим с большинством современных дистрибутивов),
+проверка запуска CLI и GUI, публикация в GitHub Releases вместе с `SHA256SUMS.txt`:
+
+```bash
+git tag v0.1.1 && git push origin v0.1.1
+```
 
 ---
 
