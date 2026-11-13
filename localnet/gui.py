@@ -260,6 +260,7 @@ class LocalNetGui:
         self.root.minsize(860, 560)
         self.root.configure(bg=C.BG)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.root.report_callback_exception = self._report_tk_error
         try:
             self._icon = tk.PhotoImage(data=ICON_PNG_B64)
             self.root.iconphoto(True, self._icon)
@@ -352,6 +353,18 @@ class LocalNetGui:
 
         for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
             self.root.bind_all(seq, self._on_wheel, add="+")
+
+    def _report_tk_error(self, exc_type, exc, tb) -> None:
+        """Ошибка в обработчике кнопки/события: пишем в журнал и показываем, а не молчим."""
+        import traceback
+        log.error("Ошибка интерфейса:\n%s", "".join(traceback.format_exception(exc_type, exc, tb)))
+        try:
+            from .utils import user_config_dir
+            messagebox.showerror(APP_NAME, f"Ошибка интерфейса: {exc_type.__name__}: {exc}\n\n"
+                                           f"Подробности в журнале:\n{user_config_dir() / 'logs' / 'localnet.log'}",
+                                 parent=self.root)
+        except tk.TclError:
+            pass
 
     # ---------------------------------------------------------- placeholder
 
@@ -1139,7 +1152,15 @@ class LocalNetGui:
         _open_path(str(path))
 
     def open_settings(self) -> None:
-        SettingsDialog(self)
+        existing = getattr(self, "_settings", None)
+        try:
+            if existing is not None and existing.top.winfo_exists():
+                existing.top.deiconify()
+                existing.top.lift()
+                return
+        except tk.TclError:
+            pass
+        self._settings = SettingsDialog(self)
 
 
 # --------------------------------------------------------------------------- #
@@ -1154,7 +1175,8 @@ class SettingsDialog:
         top.title("Настройки")
         top.transient(gui.root)
         top.resizable(False, False)
-        top.grab_set()
+        # Окно скрыто, пока не заполнено полями: так не бывает «белого окна».
+        top.withdraw()
 
         tk.Label(top, text="Настройки", font=f.title, bg=C.PANEL, fg=C.TEXT).grid(
             row=0, column=0, columnspan=3, sticky="w", padx=20, pady=(18, 10))
@@ -1185,13 +1207,26 @@ class SettingsDialog:
         self._button(buttons, "Отмена", top.destroy, primary=False).pack(side=tk.RIGHT, padx=(8, 0))
         self._button(buttons, "Сохранить", self.save, primary=True).pack(side=tk.RIGHT)
         top.bind("<Escape>", lambda _e: top.destroy())
+        top.bind("<Return>", lambda _e: self.save())
         # по центру главного окна
         top.update_idletasks()
         root = gui.root
         x = root.winfo_rootx() + (root.winfo_width() - top.winfo_reqwidth()) // 2
         y = root.winfo_rooty() + (root.winfo_height() - top.winfo_reqheight()) // 3
         top.geometry(f"+{max(0, x)}+{max(0, y)}")
-        top.bind("<Return>", lambda _e: self.save())
+        top.deiconify()
+        top.lift()
+        # Модальность — по возможности. В некоторых оконных менеджерах (в т.ч. Fly)
+        # захват ввода до отображения окна завершается ошибкой «window not viewable».
+        top.after(150, self._try_grab)
+
+    def _try_grab(self) -> None:
+        try:
+            if self.top.winfo_exists() and self.top.winfo_viewable():
+                self.top.grab_set()
+                self.top.focus_force()
+        except tk.TclError as exc:
+            log.debug("Не удалось сделать окно настроек модальным: %s", exc)
 
     def _entry(self, var: tk.StringVar, parent: Optional[tk.Widget] = None) -> tk.Entry:
         return tk.Entry(parent or self.top, textvariable=var, font=self.gui.f.text, relief=tk.FLAT, bg=C.SEARCH_BG,
