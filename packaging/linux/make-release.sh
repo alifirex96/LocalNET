@@ -32,6 +32,15 @@ PY="LocalNET-$VERSION-python"
 mkdir -p "$WORK/$PY"
 cp -R "$ROOT/localnet" "$WORK/$PY/"
 find "$WORK/$PY" -name '__pycache__' -type d -prune -exec rm -rf {} +
+# tkdnd для перетаскивания файлов (если установлен в среде сборки): только Linux x86_64.
+# При включённой ЗПС его библиотека не загрузится — тогда работают кнопка и Ctrl+V.
+DND=$(python3 -c 'import os, tkinterdnd2; print(os.path.dirname(tkinterdnd2.__file__))' 2>/dev/null || true)
+if [ -n "$DND" ] && [ -d "$DND/tkdnd/linux-x64" ]; then
+    mkdir -p "$WORK/$PY/tkinterdnd2/tkdnd"
+    cp "$DND"/*.py "$WORK/$PY/tkinterdnd2/"
+    cp -R "$DND/tkdnd/linux-x64" "$WORK/$PY/tkinterdnd2/tkdnd/"
+    echo "tkinterdnd2 добавлен в python-вариант"
+fi
 add_common "$WORK/$PY"
 cat > "$WORK/$PY/localnet.sh" <<'EOF'
 #!/bin/sh

@@ -102,6 +102,7 @@ if [ "$MODE" = binary ]; then
     chmod +x "$TMP/LocalNET"
 else
     cp -R "$SRC_DIR/localnet" "$TMP/" || die "копирование не удалось"
+    [ -d "$SRC_DIR/tkinterdnd2" ] && cp -R "$SRC_DIR/tkinterdnd2" "$TMP/"
     find "$TMP/localnet" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null
 fi
 cp "$SRC_DIR/localnet.png" "$TMP/" 2>/dev/null

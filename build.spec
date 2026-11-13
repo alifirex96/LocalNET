@@ -18,6 +18,16 @@
 """
 
 import os
+import sys
+
+# tkdnd (перетаскивание файлов) — только библиотека для текущей платформы.
+try:
+    from PyInstaller.utils.hooks import collect_data_files
+    _plat = {"win32": "win-", "darwin": "osx-"}.get(sys.platform, "linux-")
+    dnd_datas = [(src, dst) for src, dst in collect_data_files("tkinterdnd2")
+                 if "tkdnd" not in dst.replace("\\", "/") or _plat in dst.replace("\\", "/")]
+except Exception:  # tkinterdnd2 не установлен — сборка без перетаскивания
+    dnd_datas = []
 
 console = os.environ.get("LOCALNET_CONSOLE", "") == "1"
 onedir = os.environ.get("LOCALNET_ONEDIR", "") == "1"
@@ -26,8 +36,8 @@ a = Analysis(
     ["localnet_launcher.py"],
     pathex=[],
     binaries=[],
-    datas=[],
-    hiddenimports=["zmq", "zmq.backend.cython"],
+    datas=dnd_datas,
+    hiddenimports=["zmq", "zmq.backend.cython", "tkinterdnd2"],
     hookspath=[],
     runtime_hooks=[],
     excludes=["pytest", "unittest", "pydoc", "doctest"],
