@@ -1,20 +1,24 @@
-"""Текстовые сообщения поверх ZeroMQ (ROUTER/DEALER).
+"""Текстовые сообщения по протоколу ZeroMQ (ROUTER/DEALER).
 
 Схема:
 
-* каждый узел держит один сокет **ROUTER**, привязанный к ``tcp://*:msg_port``,
+* каждый узел держит один сокет **ROUTER**, слушающий ``tcp://*:msg_port``,
   — это его «почтовый ящик»;
-* для отправки пиру создаётся сокет **DEALER** с identity = свой ``node_id``,
+* для отправки пиру открывается **DEALER** с identity = свой ``node_id``,
   подключённый к ROUTER пира; DEALER'ы кешируются по ``node_id``;
 * получатель отвечает на каждое сообщение подтверждением (``ack``) через свой
   ROUTER — оно приходит обратно в DEALER отправителя. Так отправитель узнаёт,
   доставлено ли сообщение (✓) или нет (по таймауту ``ACK_TIMEOUT``);
-* «общий чат» — это рассылка одного и того же сообщения каждому online-пиру
-  (fan-out). PUB/SUB не выбран, т.к. он не даёт подтверждений, теряет первые
+* «общий чат» — рассылка одного и того же сообщения каждому online-пиру
+  (fan-out). PUB/SUB не выбран: он не даёт подтверждений, теряет первые
   сообщения после подключения («slow joiner») и требует второй сокет/порт.
 
-ZeroMQ-сокеты не потокобезопасны, поэтому ими владеет единственный поток
-``messaging``; остальные потоки передают ему команды через очередь.
+Два взаимозаменяемых транспорта с одинаковым протоколом «по проводу»:
+
+* ``zmq`` — библиотека pyzmq (libzmq), используется, если установлена;
+* ``python`` — собственная реализация ZMTP 3.0 на чистом Python (:mod:`localnet.zmtp`).
+  Нужна там, где бинарные модули запрещены или не установлены (Astra Linux с ЗПС,
+  запуск на системном python3 без pip). Узлы с разными транспортами совместимы.
 """
 
 from __future__ import annotations
@@ -22,24 +26,37 @@ from __future__ import annotations
 import json
 import logging
 import queue
+import socket
 import threading
 import time
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-import zmq
-
 from . import PROTOCOL_VERSION
 from .discovery import PeerRegistry
 from .models import ChatMessage, Peer, new_id
 from .utils import canonical_json, sign, verify
+from .zmtp import ZmtpConnection, ZmtpError
+
+try:  # pyzmq необязателен — без него работает транспорт на чистом Python
+    import zmq
+except Exception:  # noqa: BLE001 - ImportError или ошибка загрузки .so (ЗПС, glibc)
+    zmq = None
 
 log = logging.getLogger(__name__)
 
 MAX_TEXT = 16 * 1024            # максимальная длина текста сообщения (символов)
-MAX_WIRE_MESSAGE = 256 * 1024   # жёсткий лимит размера кадра ZeroMQ (защита памяти)
+MAX_WIRE_MESSAGE = 256 * 1024   # жёсткий лимит размера кадра (защита памяти)
 ACK_TIMEOUT = 8.0               # сек. ожидания подтверждения доставки
 POLL_MS = 50
+CONNECT_TIMEOUT = 3.0
+RECONNECT_DELAY = 1.0
+
+TRANSPORTS = ("auto", "zmq", "python")
+
+
+def zmq_available() -> bool:
+    return zmq is not None
 
 
 @dataclass
@@ -90,8 +107,27 @@ def decode_frame(data: bytes, secret: str) -> Optional[dict]:
     return obj
 
 
-class Messenger:
-    """Поток обмена сообщениями."""
+def Messenger(*args, transport: str = "auto", **kwargs) -> "BaseMessenger":
+    """Создаёт мессенджер с подходящим транспортом.
+
+    ``auto`` — pyzmq, если доступен, иначе чистый Python.
+    """
+    if transport not in TRANSPORTS:
+        log.warning("Неизвестный транспорт %r, используется auto", transport)
+        transport = "auto"
+    if transport == "zmq" and zmq is None:
+        log.warning("pyzmq недоступен — используется транспорт на чистом Python")
+        transport = "python"
+    if transport == "auto":
+        transport = "zmq" if zmq is not None else "python"
+    cls = ZmqMessenger if transport == "zmq" else PyMessenger
+    return cls(*args, **kwargs)
+
+
+class BaseMessenger:
+    """Общая логика: очередь отправки, подтверждения, дедупликация, таймауты."""
+
+    transport_name = "?"
 
     def __init__(
         self,
@@ -114,18 +150,163 @@ class Messenger:
         self.on_delivered = on_delivered  # (msg_id, peer_id)
         self.on_failed = on_failed        # (msg_id, peer_id)
 
-        self._ctx = zmq.Context.instance()
-        self._router: Optional[zmq.Socket] = None
-        self._dealers: dict[str, tuple[str, zmq.Socket]] = {}  # node_id -> (endpoint, socket)
-        self._commands: "queue.Queue[tuple]" = queue.Queue()
+        self._lock = threading.Lock()
         self._pending: dict[tuple[str, str], _Pending] = {}
         self._seen: dict[str, float] = {}  # защита от дублей при повторной доставке
         self._stop = threading.Event()
-        self._thread: Optional[threading.Thread] = None
 
-    # ------------------------------------------------------------------ #
-    # Публичный API (вызывается из любых потоков)
-    # ------------------------------------------------------------------ #
+    # ---------------------------------------------------- публичный API
+
+    def start(self) -> None:  # pragma: no cover - переопределяется
+        raise NotImplementedError
+
+    def stop(self) -> None:  # pragma: no cover - переопределяется
+        raise NotImplementedError
+
+    def forget_peer(self, node_id: str) -> None:  # pragma: no cover - переопределяется
+        raise NotImplementedError
+
+    def send(self, text: str, to: Optional[str] = None) -> ChatMessage:
+        """Ставит сообщение в очередь. ``to=None`` — всем online-пирам."""
+        text = text.strip()
+        if not text:
+            raise ValueError("Пустое сообщение")
+        if len(text) > MAX_TEXT:
+            raise ValueError(f"Сообщение длиннее {MAX_TEXT} символов")
+        msg = ChatMessage(
+            msg_id=new_id(),
+            sender_id=self.node_id,
+            sender_nick=self.get_nickname(),
+            text=text,
+            to=to,
+            outgoing=True,
+        )
+        self._submit(msg)
+        return msg
+
+    def _submit(self, msg: ChatMessage) -> None:  # pragma: no cover - переопределяется
+        raise NotImplementedError
+
+    def _transport_send(self, peer: Peer, payload: bytes) -> bool:  # pragma: no cover
+        raise NotImplementedError
+
+    # ---------------------------------------------------- общая логика
+
+    def _do_send(self, msg: ChatMessage) -> None:
+        if msg.to is None:
+            targets = self.registry.online()
+        else:
+            peer = self.registry.get(msg.to)
+            targets = [peer] if peer is not None else []
+        if not targets:
+            if msg.to is not None:
+                self._emit(self.on_failed, msg.msg_id, msg.to)
+            return
+        payload = encode_chat(msg, self.secret)
+        for peer in targets:
+            if not peer.online:
+                self._emit(self.on_failed, msg.msg_id, peer.node_id)
+                continue
+            # Регистрируем ожидание до отправки: ack может прийти очень быстро.
+            with self._lock:
+                self._pending[(msg.msg_id, peer.node_id)] = _Pending(
+                    msg, peer.node_id, time.monotonic() + ACK_TIMEOUT)
+            if not self._transport_send(peer, payload):
+                with self._lock:
+                    self._pending.pop((msg.msg_id, peer.node_id), None)
+                self._emit(self.on_failed, msg.msg_id, peer.node_id)
+
+    def _handle_incoming(self, identity: bytes, data: bytes) -> Optional[bytes]:
+        """Обрабатывает входящий кадр; возвращает ack для отправки или None."""
+        obj = decode_frame(data, self.secret)
+        if obj is None or obj["type"] != "chat":
+            log.debug("Отброшен некорректный кадр от %r", identity[:32])
+            return None
+        # identity DEALER'а = node_id отправителя: сверяем, чтобы нельзя было подделать поле from.
+        if identity.decode("ascii", "replace") != obj["from"]:
+            log.debug("identity не совпадает с полем from — отброшено")
+            return None
+        ack = {"proto": PROTOCOL_VERSION, "type": "ack", "id": obj["id"], "from": self.node_id}
+        ack["sig"] = sign(ack, self.secret)
+
+        now = time.monotonic()
+        with self._lock:
+            duplicate = obj["id"] in self._seen
+            self._seen[obj["id"]] = now
+            if len(self._seen) > 5000:
+                cutoff = now - 600
+                self._seen = {k: v for k, v in self._seen.items() if v > cutoff}
+        if duplicate:
+            return canonical_json(ack)  # подтверждаем повторно, но не показываем
+
+        to = obj.get("to")
+        if to is None or to == self.node_id:
+            peer = self.registry.get(obj["from"])
+            msg = ChatMessage(
+                msg_id=obj["id"],
+                sender_id=obj["from"],
+                sender_nick=obj["nick"][:64],
+                text=obj["text"][:MAX_TEXT],
+                to=to,
+                ts=float(obj["ts"]),
+                sender_ip=peer.ip if peer else "",
+            )
+            if self.on_message is not None:
+                try:
+                    self.on_message(msg)
+                except Exception:  # noqa: BLE001
+                    log.exception("Ошибка обработчика сообщения")
+        return canonical_json(ack)
+
+    def _handle_ack(self, data: bytes) -> None:
+        obj = decode_frame(data, self.secret)
+        if obj is None or obj["type"] != "ack":
+            return
+        with self._lock:
+            pending = self._pending.pop((obj["id"], obj["from"]), None)
+        if pending is not None:
+            self._emit(self.on_delivered, obj["id"], obj["from"])
+
+    def _check_timeouts(self) -> None:
+        now = time.monotonic()
+        with self._lock:
+            if not self._pending:
+                return
+            expired = [k for k, p in self._pending.items() if now > p.deadline]
+            for key in expired:
+                del self._pending[key]
+        for msg_id, peer_id in expired:
+            log.info("Сообщение %s не подтверждено пиром %s", msg_id[:8], peer_id[:8])
+            self._emit(self.on_failed, msg_id, peer_id)
+
+    @staticmethod
+    def _emit(cb: Optional[Callable[[str, str], None]], msg_id: str, peer_id: str) -> None:
+        if cb is None:
+            return
+        try:
+            cb(msg_id, peer_id)
+        except Exception:  # noqa: BLE001
+            log.exception("Ошибка обработчика статуса сообщения")
+
+
+# =========================================================================== #
+# Транспорт pyzmq
+# =========================================================================== #
+
+class ZmqMessenger(BaseMessenger):
+    """ZeroMQ-сокеты не потокобезопасны: ими владеет один поток ``messaging``."""
+
+    transport_name = "zmq"
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        assert zmq is not None
+        self._ctx = zmq.Context.instance()
+        self._router = None
+        self._poller = None
+        self._dealers: dict = {}  # node_id -> (endpoint, socket)
+        self._commands: "queue.Queue[tuple]" = queue.Queue()
+        self._thread: Optional[threading.Thread] = None
 
     def start(self) -> None:
         """Привязывает ROUTER. Если порт занят — берёт свободный (он анонсируется)."""
@@ -146,7 +327,7 @@ class Messenger:
         self._router = router
         self._thread = threading.Thread(target=self._run, name="messaging", daemon=True)
         self._thread.start()
-        log.info("Сообщения: ZeroMQ ROUTER на TCP %d", self.port)
+        log.info("Сообщения: ZeroMQ (pyzmq) ROUTER на TCP %d", self.port)
 
     def stop(self) -> None:
         if self._thread is None:
@@ -155,41 +336,20 @@ class Messenger:
         self._thread.join(timeout=3)
         self._thread = None
 
-    def send(self, text: str, to: Optional[str] = None) -> ChatMessage:
-        """Ставит сообщение в очередь. ``to=None`` — всем online-пирам."""
-        text = text.strip()
-        if not text:
-            raise ValueError("Пустое сообщение")
-        if len(text) > MAX_TEXT:
-            raise ValueError(f"Сообщение длиннее {MAX_TEXT} символов")
-        msg = ChatMessage(
-            msg_id=new_id(),
-            sender_id=self.node_id,
-            sender_nick=self.get_nickname(),
-            text=text,
-            to=to,
-            outgoing=True,
-        )
-        self._commands.put(("send", msg))
-        return msg
-
     def forget_peer(self, node_id: str) -> None:
-        """Закрыть DEALER пира (ушёл offline / сменил адрес)."""
         self._commands.put(("forget", node_id))
 
-    # ------------------------------------------------------------------ #
-    # Поток messaging
-    # ------------------------------------------------------------------ #
+    def _submit(self, msg: ChatMessage) -> None:
+        self._commands.put(("send", msg))
 
     def _run(self) -> None:
-        poller = zmq.Poller()
-        assert self._router is not None
-        poller.register(self._router, zmq.POLLIN)
+        self._poller = zmq.Poller()
+        self._poller.register(self._router, zmq.POLLIN)
         try:
             while not self._stop.is_set():
-                self._process_commands(poller)
+                self._process_commands()
                 try:
-                    events = dict(poller.poll(POLL_MS))
+                    events = dict(self._poller.poll(POLL_MS))
                 except zmq.ZMQError as exc:
                     log.warning("Ошибка poll: %s", exc)
                     time.sleep(0.1)
@@ -202,7 +362,7 @@ class Messenger:
         finally:
             self._close_all()
 
-    def _process_commands(self, poller: zmq.Poller) -> None:
+    def _process_commands(self) -> None:
         while True:
             try:
                 cmd = self._commands.get_nowait()
@@ -210,43 +370,28 @@ class Messenger:
                 return
             try:
                 if cmd[0] == "send":
-                    self._do_send(cmd[1], poller)
+                    self._do_send(cmd[1])
                 elif cmd[0] == "forget":
-                    self._close_dealer(cmd[1], poller)
+                    self._close_dealer(cmd[1])
             except Exception:  # noqa: BLE001
                 log.exception("Ошибка обработки команды %s", cmd[0])
 
-    def _do_send(self, msg: ChatMessage, poller: zmq.Poller) -> None:
-        if msg.to is None:
-            targets = self.registry.online()
-        else:
-            peer = self.registry.get(msg.to)
-            targets = [peer] if peer is not None else []
-        if not targets:
-            if msg.to is not None:
-                self._emit(self.on_failed, msg.msg_id, msg.to)
-            return
-        payload = encode_chat(msg, self.secret)
-        for peer in targets:
-            if not peer.online:
-                self._emit(self.on_failed, msg.msg_id, peer.node_id)
-                continue
-            dealer = self._get_dealer(peer, poller)
-            try:
-                dealer.send(payload, zmq.NOBLOCK)
-            except zmq.ZMQError as exc:
-                log.warning("Не удалось отправить сообщение %s: %s", peer.display_name(), exc)
-                self._emit(self.on_failed, msg.msg_id, peer.node_id)
-                continue
-            self._pending[(msg.msg_id, peer.node_id)] = _Pending(msg, peer.node_id, time.monotonic() + ACK_TIMEOUT)
+    def _transport_send(self, peer: Peer, payload: bytes) -> bool:
+        dealer = self._get_dealer(peer)
+        try:
+            dealer.send(payload, zmq.NOBLOCK)
+            return True
+        except zmq.ZMQError as exc:
+            log.warning("Не удалось отправить сообщение %s: %s", peer.display_name(), exc)
+            return False
 
-    def _get_dealer(self, peer: Peer, poller: zmq.Poller) -> zmq.Socket:
+    def _get_dealer(self, peer: Peer):
         endpoint = peer.msg_endpoint
         cached = self._dealers.get(peer.node_id)
         if cached is not None:
             if cached[0] == endpoint:
                 return cached[1]
-            self._close_dealer(peer.node_id, poller)
+            self._close_dealer(peer.node_id)
         sock = self._ctx.socket(zmq.DEALER)
         sock.setsockopt(zmq.IDENTITY, self.node_id.encode("ascii"))
         sock.setsockopt(zmq.LINGER, 0)
@@ -258,21 +403,21 @@ class Messenger:
         sock.setsockopt(zmq.HEARTBEAT_IVL, 5000)
         sock.setsockopt(zmq.HEARTBEAT_TIMEOUT, 15000)
         sock.connect(endpoint)
-        poller.register(sock, zmq.POLLIN)
+        self._poller.register(sock, zmq.POLLIN)
         self._dealers[peer.node_id] = (endpoint, sock)
         return sock
 
-    def _close_dealer(self, node_id: str, poller: zmq.Poller) -> None:
+    def _close_dealer(self, node_id: str) -> None:
         cached = self._dealers.pop(node_id, None)
         if cached is None:
             return
         try:
-            poller.unregister(cached[1])
+            self._poller.unregister(cached[1])
         except KeyError:
             pass
         cached[1].close(linger=0)
 
-    def _drain(self, sock: zmq.Socket) -> None:
+    def _drain(self, sock) -> None:
         for _ in range(1000):
             try:
                 frames = sock.recv_multipart(zmq.NOBLOCK)
@@ -285,73 +430,14 @@ class Messenger:
                 if len(frames) != 2:
                     continue
                 identity, data = frames
-                self._handle_incoming(identity, data)
-            else:
-                if len(frames) != 1:
-                    continue
+                ack = self._handle_incoming(identity, data)
+                if ack is not None:
+                    try:
+                        self._router.send_multipart([identity, ack], zmq.NOBLOCK)
+                    except zmq.ZMQError as exc:
+                        log.debug("Не удалось отправить ack: %s", exc)
+            elif len(frames) == 1:
                 self._handle_ack(frames[0])
-
-    def _handle_incoming(self, identity: bytes, data: bytes) -> None:
-        obj = decode_frame(data, self.secret)
-        if obj is None or obj["type"] != "chat":
-            log.debug("Отброшен некорректный кадр от %r", identity[:32])
-            return
-        # identity DEALER'а = node_id отправителя: сверяем, чтобы нельзя было подделать поле from.
-        if identity.decode("ascii", "replace") != obj["from"]:
-            log.debug("identity не совпадает с полем from — отброшено")
-            return
-        ack = {"proto": PROTOCOL_VERSION, "type": "ack", "id": obj["id"], "from": self.node_id}
-        ack["sig"] = sign(ack, self.secret)
-        try:
-            assert self._router is not None
-            self._router.send_multipart([identity, canonical_json(ack)], zmq.NOBLOCK)
-        except zmq.ZMQError as exc:
-            log.debug("Не удалось отправить ack: %s", exc)
-
-        now = time.monotonic()
-        if obj["id"] in self._seen:
-            return  # дубль — подтверждаем повторно, но не показываем
-        self._seen[obj["id"]] = now
-        if len(self._seen) > 5000:
-            cutoff = now - 600
-            self._seen = {k: v for k, v in self._seen.items() if v > cutoff}
-
-        to = obj.get("to")
-        if to is not None and to != self.node_id:
-            return  # личное сообщение не нам
-        peer = self.registry.get(obj["from"])
-        msg = ChatMessage(
-            msg_id=obj["id"],
-            sender_id=obj["from"],
-            sender_nick=obj["nick"][:64],
-            text=obj["text"][:MAX_TEXT],
-            to=to,
-            ts=float(obj["ts"]),
-            sender_ip=peer.ip if peer else "",
-        )
-        if self.on_message is not None:
-            try:
-                self.on_message(msg)
-            except Exception:  # noqa: BLE001
-                log.exception("Ошибка обработчика сообщения")
-
-    def _handle_ack(self, data: bytes) -> None:
-        obj = decode_frame(data, self.secret)
-        if obj is None or obj["type"] != "ack":
-            return
-        pending = self._pending.pop((obj["id"], obj["from"]), None)
-        if pending is not None:
-            self._emit(self.on_delivered, obj["id"], obj["from"])
-
-    def _check_timeouts(self) -> None:
-        if not self._pending:
-            return
-        now = time.monotonic()
-        for key, pending in list(self._pending.items()):
-            if now > pending.deadline:
-                del self._pending[key]
-                log.info("Сообщение %s не подтверждено пиром %s", key[0][:8], key[1][:8])
-                self._emit(self.on_failed, key[0], key[1])
 
     def _close_all(self) -> None:
         for _endpoint, sock in self._dealers.values():
@@ -361,11 +447,201 @@ class Messenger:
             self._router.close(linger=0)
             self._router = None
 
-    @staticmethod
-    def _emit(cb: Optional[Callable[[str, str], None]], msg_id: str, peer_id: str) -> None:
-        if cb is None:
-            return
+
+# =========================================================================== #
+# Транспорт на чистом Python (ZMTP 3.0)
+# =========================================================================== #
+
+class _OutgoingLink:
+    """Исходящее соединение DEALER к одному пиру: очередь + поток отправки + поток чтения ack."""
+
+    def __init__(self, owner: "PyMessenger", node_id: str, ip: str, port: int) -> None:
+        self.owner = owner
+        self.node_id = node_id
+        self.addr = (ip, port)
+        self.queue: "queue.Queue[bytes]" = queue.Queue(maxsize=1000)
+        self.closed = threading.Event()
+        self.conn: Optional[ZmtpConnection] = None
+        self.thread = threading.Thread(target=self._run, name=f"msg-out-{node_id[:8]}", daemon=True)
+        self.thread.start()
+
+    def enqueue(self, payload: bytes) -> bool:
         try:
-            cb(msg_id, peer_id)
+            self.queue.put_nowait(payload)
+            return True
+        except queue.Full:
+            return False
+
+    def close(self) -> None:
+        self.closed.set()
+        conn = self.conn
+        if conn is not None:
+            conn.close()
+
+    def _connect(self) -> ZmtpConnection:
+        sock = socket.create_connection(self.addr, timeout=CONNECT_TIMEOUT)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        conn = ZmtpConnection(sock, MAX_WIRE_MESSAGE)
+        conn.handshake("DEALER", identity=self.owner.node_id.encode("ascii"))
+        sock.settimeout(None)
+        reader = threading.Thread(target=self._read_acks, args=(conn,), name=f"msg-ack-{self.node_id[:8]}",
+                                  daemon=True)
+        reader.start()
+        return conn
+
+    def _run(self) -> None:
+        payload: Optional[bytes] = None
+        while not self.closed.is_set() and not self.owner._stop.is_set():
+            if payload is None:
+                try:
+                    payload = self.queue.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+            try:
+                if self.conn is None:
+                    self.conn = self._connect()
+                self.conn.send_message([payload])
+                payload = None
+            except (OSError, ZmtpError) as exc:
+                # Как и libzmq: сообщение остаётся в очереди, пробуем переподключиться.
+                # Если пир так и не ответит — сработает таймаут подтверждения.
+                log.debug("Соединение с %s:%d: %s", *self.addr, exc)
+                if self.conn is not None:
+                    self.conn.close()
+                    self.conn = None
+                self.closed.wait(RECONNECT_DELAY)
+        if self.conn is not None:
+            self.conn.close()
+
+    def _read_acks(self, conn: ZmtpConnection) -> None:
+        try:
+            while not self.closed.is_set():
+                frames = conn.recv_message()
+                if len(frames) == 1:
+                    self.owner._handle_ack(frames[0])
+        except (OSError, ZmtpError):
+            pass
+        finally:
+            if self.conn is conn:
+                conn.close()
+
+
+class PyMessenger(BaseMessenger):
+    """Транспорт без бинарных зависимостей: блокирующие сокеты и потоки."""
+
+    transport_name = "python"
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._server: Optional[socket.socket] = None
+        self._threads: list[threading.Thread] = []
+        self._links: dict[str, _OutgoingLink] = {}
+        self._links_lock = threading.Lock()
+        self._incoming: set[ZmtpConnection] = set()
+
+    def start(self) -> None:
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        if not _is_windows():  # на Windows SO_REUSEADDR позволяет «украсть» занятый порт
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            srv.bind(("", self.requested_port))
+        except OSError as exc:
+            log.warning("Порт сообщений %d занят (%s), выбираю свободный", self.requested_port, exc)
+            srv.bind(("", 0))
+        srv.listen(64)
+        srv.settimeout(0.5)
+        self.port = srv.getsockname()[1]
+        self._server = srv
+        for target, name in ((self._accept_loop, "msg-server"), (self._timeout_loop, "msg-timeouts")):
+            th = threading.Thread(target=target, name=name, daemon=True)
+            th.start()
+            self._threads.append(th)
+        log.info("Сообщения: ZeroMQ-совместимый транспорт на чистом Python, TCP %d", self.port)
+
+    def stop(self) -> None:
+        if self._server is None:
+            return
+        self._stop.set()
+        with self._links_lock:
+            links = list(self._links.values())
+            self._links.clear()
+        for link in links:
+            link.close()
+        for conn in list(self._incoming):
+            conn.close()
+        for th in self._threads:
+            th.join(timeout=3)
+        try:
+            self._server.close()
+        except OSError:
+            pass
+        self._server = None
+
+    def forget_peer(self, node_id: str) -> None:
+        with self._links_lock:
+            link = self._links.pop(node_id, None)
+        if link is not None:
+            link.close()
+
+    def _submit(self, msg: ChatMessage) -> None:
+        # Отправка неблокирующая (только постановка в очереди), можно звать из GUI-потока.
+        try:
+            self._do_send(msg)
         except Exception:  # noqa: BLE001
-            log.exception("Ошибка обработчика статуса сообщения")
+            log.exception("Ошибка отправки сообщения")
+
+    def _transport_send(self, peer: Peer, payload: bytes) -> bool:
+        with self._links_lock:
+            link = self._links.get(peer.node_id)
+            if link is not None and (link.addr != (peer.ip, peer.msg_port) or link.closed.is_set()):
+                link.close()
+                link = None
+            if link is None:
+                link = _OutgoingLink(self, peer.node_id, peer.ip, peer.msg_port)
+                self._links[peer.node_id] = link
+        return link.enqueue(payload)
+
+    def _timeout_loop(self) -> None:
+        while not self._stop.wait(0.2):
+            self._check_timeouts()
+
+    def _accept_loop(self) -> None:
+        assert self._server is not None
+        while not self._stop.is_set():
+            try:
+                sock, addr = self._server.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                if self._stop.is_set():
+                    break
+                time.sleep(0.2)
+                continue
+            threading.Thread(target=self._serve, args=(sock, addr), name=f"msg-in-{addr[0]}",
+                             daemon=True).start()
+
+    def _serve(self, sock: socket.socket, addr) -> None:
+        conn = ZmtpConnection(sock, MAX_WIRE_MESSAGE)
+        self._incoming.add(conn)
+        try:
+            sock.settimeout(CONNECT_TIMEOUT)
+            conn.handshake("ROUTER")
+            sock.settimeout(None)
+            identity = conn.peer_identity
+            while not self._stop.is_set():
+                frames = conn.recv_message()
+                if not frames:
+                    continue
+                ack = self._handle_incoming(identity, frames[-1])
+                if ack is not None:
+                    conn.send_message([ack])
+        except (OSError, ZmtpError) as exc:
+            log.debug("Входящее соединение %s: %s", addr[0], exc)
+        finally:
+            self._incoming.discard(conn)
+            conn.close()
+
+
+def _is_windows() -> bool:
+    import os
+    return os.name == "nt"

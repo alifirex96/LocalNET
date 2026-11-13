@@ -72,6 +72,7 @@ class LocalNetCore:
             on_message=lambda m: self._emit(EventType.MESSAGE, m),
             on_delivered=lambda mid, pid: self._emit(EventType.MESSAGE_DELIVERED, (mid, pid)),
             on_failed=lambda mid, pid: self._emit(EventType.MESSAGE_FAILED, (mid, pid)),
+            transport=config.transport,
         )
         self.files = FileTransferManager(
             node_id=self.node_id,

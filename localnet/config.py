@@ -69,6 +69,9 @@ class Config:
     announce_interval: float = 1.0
     peer_timeout: float = 6.0
     log_level: str = "INFO"
+    # Транспорт сообщений: auto (pyzmq, если доступен, иначе чистый Python), zmq, python.
+    # Оба транспорта совместимы по протоколу.
+    transport: str = "auto"
 
     # Путь, откуда загружен конфиг (не сохраняется в файл).
     path: Optional[str] = field(default=None, repr=False, compare=False)
@@ -91,6 +94,9 @@ class Config:
         self.nickname = (str(self.nickname).strip() or _default_nickname())[:64]
         self.announce_interval = max(0.2, float(self.announce_interval))
         self.peer_timeout = max(self.announce_interval * 3, float(self.peer_timeout))
+        if self.transport not in ("auto", "zmq", "python"):
+            log.warning("Неизвестный transport=%r, используется auto", self.transport)
+            self.transport = "auto"
         if isinstance(self.broadcast_addresses, str):
             self.broadcast_addresses = [self.broadcast_addresses]
         if isinstance(self.static_peers, str):
