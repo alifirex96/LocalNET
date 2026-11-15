@@ -1,0 +1,91 @@
+name: Release
+
+# Публикация релиза: git tag v0.2.0 && git push origin v0.2.0
+# или вручную: Actions → Release → Run workflow (workflow должен быть в main).
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Тег релиза (например, v0.2.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    # Самый старый доступный раннер: glibc 2.35 → программа запускается на
+    # Astra Linux 1.8 (2.36), Debian 12, Ubuntu 22.04+, РЕД ОС, ALT и т.п.
+    runs-on: ubuntu-22.04
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      LOCALNET_ONEDIR: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Зависимости
+        run: |
+          python -m pip install -r requirements-dev.txt
+          sudo apt-get update -q && sudo apt-get install -y -q xvfb
+      - name: Тесты
+        run: python -m pytest -q
+      - name: Сборка (папкой — не зависит от noexec на /tmp)
+        run: pyinstaller --clean --noconfirm build.spec
+      - name: Проверка совместимости glibc
+        run: sh packaging/linux/check-glibc.sh dist/LocalNET 2.35
+      - name: Упаковка
+        run: sh packaging/linux/make-release.sh "$TAG" dist/LocalNET out
+      - name: Проверка установки и запуска (как у пользователя, без root)
+        run: |
+          set -eu
+          cd "$RUNNER_TEMP"
+          tar xzf "$GITHUB_WORKSPACE/out/LocalNET-$TAG-linux-x86_64.tar.gz"
+          tar xzf "$GITHUB_WORKSPACE/out/LocalNET-$TAG-python.tar.gz"
+          export HOME="$RUNNER_TEMP/home-bin"; mkdir -p "$HOME/Desktop"
+          sh "LocalNET-$TAG-linux-x86_64/install.sh"
+          test -x "$HOME/.local/bin/localnet" && test -f "$HOME/Desktop/localnet.desktop"
+          set +e
+          timeout 8 xvfb-run -a "$HOME/.local/bin/localnet" </dev/null >/dev/null 2>&1; code=$?
+          set -e
+          echo "GUI (собранная программа): $code"; test "$code" -eq 124
+          # Вариант для системного python3 (без pyzmq) — CLI.
+          export HOME="$RUNNER_TEMP/home-py"; mkdir -p "$HOME"
+          PATH=/usr/bin:/bin sh "LocalNET-$TAG-python/install.sh"
+          echo /quit | PATH=/usr/bin:/bin timeout 15 "$HOME/.local/bin/localnet" --cli
+      - name: Публикация релиза
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd out
+          cat > notes.md <<NOTES
+          ## LocalNET ${TAG} для Linux
+
+          | Файл | Для чего |
+          |---|---|
+          | \`LocalNET-${TAG}-linux-x86_64.tar.gz\` | Готовая программа, Python не нужен. Astra Linux 1.8 (без ЗПС), Debian 12, Ubuntu 22.04+ и новее |
+          | \`LocalNET-${TAG}-python.tar.gz\` | Для системного python3 (3.8+). **Astra Linux с включённой ЗПС**, другие архитектуры. pyzmq не нужен |
+
+          ### Установка (без прав root)
+
+          \`\`\`bash
+          tar xzf LocalNET-${TAG}-linux-x86_64.tar.gz      # или ...-python.tar.gz
+          cd LocalNET-${TAG}-linux-x86_64
+          ./install.sh
+          \`\`\`
+
+          Появится ярлык в меню «Сеть» и на рабочем столе, команда \`localnet\`.
+          Если программа не запускается, откроется окно с причиной; журнал: \`~/.config/localnet/logs/\`.
+
+          Без установки: \`./LocalNET\` в распакованной папке (или \`./localnet.sh\` для python-варианта).
+          Контрольные суммы — \`SHA256SUMS.txt\`.
+          NOTES
+          FILES="LocalNET-${TAG}-linux-x86_64.tar.gz LocalNET-${TAG}-python.tar.gz SHA256SUMS.txt"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" $FILES --clobber
+          else
+            gh release create "$TAG" $FILES --title "LocalNET $TAG" --notes-file notes.md --target "$GITHUB_SHA"
+          fi

@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "localnet"
+dynamic = ["version"]
+description = "Портативный LAN-мессенджер и файлообменник без центрального сервера"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = ["pyzmq>=25.0"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: Communications :: Chat",
+    "Topic :: Communications :: File Sharing",
+]
+
+[project.optional-dependencies]
+dnd = ["tkinterdnd2>=0.4"]
+dev = ["pytest>=7.0", "pyinstaller>=6.0", "tkinterdnd2>=0.4"]
+
+[project.scripts]
+localnet-cli = "localnet.__main__:main"
+
+[project.gui-scripts]
+localnet = "localnet.__main__:main"
+
+[tool.setuptools]
+packages = ["localnet"]
+
+[tool.setuptools.dynamic]
+version = { attr = "localnet.__version__" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
