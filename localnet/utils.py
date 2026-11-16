@@ -177,6 +177,23 @@ def unique_path(directory: Path, name: str) -> Path:
 # Сеть
 # --------------------------------------------------------------------------- #
 
+def local_ident() -> str:
+    """Стабильный отпечаток «пользователь@компьютер» (хеш, без раскрытия имён).
+
+    Не зависит от файла настроек и истории: по нему узнаётся один и тот же человек,
+    даже если его ID узла сменился (другая копия программы, переустановка).
+    """
+    override = os.environ.get("LOCALNET_IDENT", "").strip()
+    if override:  # несколько копий программы под одной учётной записью (и тесты)
+        return hashlib.sha256(f"localnet-ident:{override}".encode("utf-8")).hexdigest()[:24]
+    try:
+        user = __import__("getpass").getuser()
+    except Exception:  # noqa: BLE001
+        user = "?"
+    raw = f"localnet-ident:{user}@{socket.gethostname()}".lower().encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:24]
+
+
 def guess_local_ip() -> str:
     """Основной IP-адрес машины в LAN (без отправки пакетов наружу)."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

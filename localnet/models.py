@@ -40,6 +40,8 @@ class Peer:
     version: str = ""
     last_seen: float = field(default_factory=time.time)
     online: bool = True
+    ident: str = ""          # отпечаток «пользователь@компьютер»
+    ban_version: int = 0     # версия списка блокировок у этого узла
 
     @property
     def msg_endpoint(self) -> str:
@@ -174,6 +176,9 @@ class EventType(str, enum.Enum):
     MESSAGE_FAILED = "message_failed"
     MESSAGE_READ = "message_read"      # (peer_id, [msg_id, ...])
     REACTION = "reaction"              # (msg_id, peer_id, code или "")
+    MESSAGES_DELETED = "messages_deleted"  # [msg_id, ...]
+    PEER_MERGED = "peer_merged"        # (старый node_id, новый node_id)
+    BANS_UPDATED = "bans_updated"      # BanList
     TRANSFER_UPDATED = "transfer_updated"
     FILE_OFFER = "file_offer"
     INFO = "info"
