@@ -75,3 +75,33 @@ else:
         console=console,
         disable_windowed_traceback=False,
     )
+
+    # Отдельный исполняемый файл админ-панели (Windows: LocalNET-Admin.exe).
+    # В сборке «папкой» (Linux) админ-панель запускается файлом LocalNET-Admin,
+    # который make-release.sh кладёт рядом с программой (LocalNET --admin).
+    if not console:
+        a_admin = Analysis(
+            ["localnet_admin.py"],
+            pathex=[],
+            binaries=[],
+            datas=[],
+            hiddenimports=["zmq", "zmq.backend.cython"],
+            hookspath=[],
+            runtime_hooks=[],
+            excludes=["pytest", "unittest", "pydoc", "doctest", "tkinterdnd2"],
+            noarchive=False,
+        )
+        exe_admin = EXE(
+            PYZ(a_admin.pure),
+            a_admin.scripts,
+            a_admin.binaries,
+            a_admin.datas,
+            [],
+            name="LocalNET-Admin",
+            debug=False,
+            strip=False,
+            upx=False,
+            runtime_tmpdir=None,
+            console=False,
+            disable_windowed_traceback=False,
+        )

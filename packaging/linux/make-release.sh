@@ -49,6 +49,13 @@ DIR=$(cd "$(dirname "$0")" && pwd)
 PYTHONPATH="$DIR${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m localnet "$@"
 EOF
 chmod +x "$WORK/$PY/localnet.sh"
+cat > "$WORK/$PY/localnet-admin.sh" <<'ADMINEOF'
+#!/bin/sh
+# Админ-панель (блокировка пользователей): ./localnet-admin.sh
+DIR=$(cd "$(dirname "$0")" && pwd)
+PYTHONPATH="$DIR${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m localnet --admin "$@"
+ADMINEOF
+chmod +x "$WORK/$PY/localnet-admin.sh"
 tar -C "$WORK" -czf "$OUT/$PY.tar.gz" "$PY"
 echo "$OUT/$PY.tar.gz"
 
@@ -58,6 +65,13 @@ if [ "$ONEDIR" != "-" ]; then
     mkdir -p "$WORK/$BIN"
     cp -R "$ONEDIR/LocalNET" "$ONEDIR/_internal" "$WORK/$BIN/"
     chmod +x "$WORK/$BIN/LocalNET"
+    cat > "$WORK/$BIN/LocalNET-Admin" <<'ADMINEOF'
+#!/bin/sh
+# Админ-панель LocalNET (блокировка пользователей)
+DIR=$(cd "$(dirname "$0")" && pwd)
+exec "$DIR/LocalNET" --admin "$@"
+ADMINEOF
+    chmod +x "$WORK/$BIN/LocalNET-Admin"
     add_common "$WORK/$BIN"
     tar -C "$WORK" -czf "$OUT/$BIN.tar.gz" "$BIN"
     echo "$OUT/$BIN.tar.gz"

@@ -2,6 +2,7 @@
 # Установка LocalNET для текущего пользователя — БЕЗ прав root.
 #
 #   ./install.sh              установить (или обновить)
+#   ./install.sh --admin      установить и добавить ярлык админ-панели (только для администратора)
 #   ./install.sh --uninstall  удалить (настройки и полученные файлы остаются)
 #
 # Что делает:
@@ -40,10 +41,14 @@ say()  { printf '%s\n' "$*"; }
 warn() { printf 'ВНИМАНИЕ: %s\n' "$*" >&2; }
 die()  { printf 'ОШИБКА: %s\n' "$*" >&2; exit 1; }
 
+ADMIN=no
+[ "${1:-}" = "--admin" ] && ADMIN=yes
+
 if [ "${1:-}" = "--uninstall" ]; then
-    rm -rf "$PREFIX" "$BIN_DIR/localnet" "$APPS_DIR/$DESKTOP_FILE_NAME"
+    rm -rf "$PREFIX" "$BIN_DIR/localnet" "$BIN_DIR/localnet-admin" "$APPS_DIR/$DESKTOP_FILE_NAME" \
+        "$APPS_DIR/localnet-admin.desktop"
     DESK=$(desktop_dir)
-    [ -n "$DESK" ] && rm -f "$DESK/$DESKTOP_FILE_NAME"
+    [ -n "$DESK" ] && rm -f "$DESK/$DESKTOP_FILE_NAME" "$DESK/localnet-admin.desktop"
     say "LocalNET удалён. Настройки и журналы: ${XDG_CONFIG_HOME:-$HOME/.config}/localnet"
     exit 0
 fi
@@ -135,6 +140,23 @@ EOF
     chmod +x "$1"
 }
 write_desktop "$APPS_DIR/$DESKTOP_FILE_NAME"
+if [ "$ADMIN" = yes ]; then
+    printf '#!/bin/sh\nexec "%s/localnet" --admin "$@"\n' "$BIN_DIR" > "$BIN_DIR/localnet-admin"
+    chmod +x "$BIN_DIR/localnet-admin"
+    cat > "$APPS_DIR/localnet-admin.desktop" <<ADMINEOF
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=LocalNET — администрирование
+Comment=Блокировка и разблокировка пользователей LocalNET
+Exec="$BIN_DIR/localnet-admin"
+Icon=$PREFIX/localnet.png
+Terminal=false
+Categories=Network;System;
+ADMINEOF
+    chmod +x "$APPS_DIR/localnet-admin.desktop"
+    say "Админ-панель: меню приложений → «LocalNET — администрирование» или команда localnet-admin"
+fi
 command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$APPS_DIR" >/dev/null 2>&1
 DESK=$(desktop_dir)
 if [ -n "$DESK" ] && [ -d "$DESK" ]; then
