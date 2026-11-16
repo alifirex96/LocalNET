@@ -92,7 +92,7 @@ def decode_frame(data: bytes, secret: str) -> Optional[dict]:
         return None
     if not isinstance(obj, dict) or obj.get("proto") != PROTOCOL_VERSION:
         return None
-    if obj.get("type") not in ("chat", "ack", "read", "react"):
+    if obj.get("type") not in ("chat", "ack", "read", "react", "delete", "bans"):
         return None
     if not isinstance(obj.get("id"), str) or not isinstance(obj.get("from"), str):
         return None
@@ -103,7 +103,7 @@ def decode_frame(data: bytes, secret: str) -> Optional[dict]:
             return None
         if not isinstance(obj.get("ts"), (int, float)):
             return None
-    elif obj["type"] == "read":
+    elif obj["type"] in ("read", "delete"):
         ids = obj.get("ids")
         if (not isinstance(ids, list) or not 0 < len(ids) <= MAX_READ_IDS
                 or not all(isinstance(i, str) and 0 < len(i) <= 64 for i in ids)):
@@ -114,6 +114,10 @@ def decode_frame(data: bytes, secret: str) -> Optional[dict]:
         if not isinstance(msg, str) or not 0 < len(msg) <= 64:
             return None
         if not isinstance(code, str) or (code and code not in REACTIONS):
+            return None
+    elif obj["type"] == "bans":
+        if not isinstance(obj.get("list"), dict) or not isinstance(obj.get("pub"), str) \
+                or not isinstance(obj.get("esig"), str):
             return None
     if not verify(obj, secret):
         return None
@@ -154,6 +158,8 @@ class BaseMessenger:
         on_failed: Optional[Callable[[str, str], None]] = None,
         on_read: Optional[Callable[[str, list], None]] = None,
         on_reaction: Optional[Callable[[str, str, str], None]] = None,
+        on_delete: Optional[Callable[[str, list], None]] = None,
+        on_bans: Optional[Callable[[str, dict], None]] = None,
     ) -> None:
         self.node_id = node_id
         self.get_nickname = get_nickname
@@ -166,6 +172,8 @@ class BaseMessenger:
         self.on_failed = on_failed        # (msg_id, peer_id)
         self.on_read = on_read            # (peer_id, [msg_id])
         self.on_reaction = on_reaction    # (msg_id, peer_id, code)
+        self.on_delete = on_delete        # (peer_id, [msg_id]) — отправитель удалил свои сообщения
+        self.on_bans = on_bans            # (peer_id, кадр со списком блокировок)
 
         self._lock = threading.Lock()
         self._pending: dict[tuple[str, str], _Pending] = {}
@@ -224,6 +232,20 @@ class BaseMessenger:
         obj["sig"] = sign(obj, self.secret)
         self._submit_raw(list(peer_ids), canonical_json(obj))
 
+    def send_delete(self, msg_ids: list[str], peer_ids: list[str]) -> None:
+        """Удалить свои сообщения у собеседников («удалить у всех»)."""
+        for i in range(0, len(msg_ids), MAX_READ_IDS):
+            obj = {"proto": PROTOCOL_VERSION, "type": "delete", "id": new_id(), "from": self.node_id,
+                   "ids": list(msg_ids[i:i + MAX_READ_IDS])}
+            obj["sig"] = sign(obj, self.secret)
+            self._submit_raw(list(peer_ids), canonical_json(obj))
+
+    def send_bans(self, wire: dict, peer_ids: list[str]) -> None:
+        """Подписанный администратором список блокировок."""
+        obj = {"proto": PROTOCOL_VERSION, "type": "bans", "id": new_id(), "from": self.node_id, **wire}
+        obj["sig"] = sign(obj, self.secret)
+        self._submit_raw(list(peer_ids), canonical_json(obj))
+
     def _send_raw_now(self, peer_ids: list[str], payload: bytes) -> None:
         for pid in peer_ids:
             peer = self.registry.get(pid)
@@ -274,6 +296,12 @@ class BaseMessenger:
             return None
         if obj["type"] == "react":
             self._call(self.on_reaction, obj["msg"], obj["from"], obj["code"])
+            return None
+        if obj["type"] == "delete":
+            self._call(self.on_delete, obj["from"], obj["ids"])
+            return None
+        if obj["type"] == "bans":
+            self._call(self.on_bans, obj["from"], obj)
             return None
         ack = {"proto": PROTOCOL_VERSION, "type": "ack", "id": obj["id"], "from": self.node_id}
         ack["sig"] = sign(ack, self.secret)

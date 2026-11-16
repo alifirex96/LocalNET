@@ -166,6 +166,13 @@ class CliApp:
             elif ev.type == EventType.MESSAGE_READ:
                 names = self.core.registry.get(d[0])
                 print(f"[{ts}] ✓✓ прочитано: {names.nickname if names else d[0][:8]}")
+            elif ev.type == EventType.MESSAGES_DELETED:
+                print(f"[{ts}] удалено сообщений: {len(d)}")
+            elif ev.type == EventType.BANS_UPDATED:
+                ban = self.core.my_ban()
+                print(f"[{ts}] список блокировок обновлён" + (f"; вы заблокированы {ban.describe()}" if ban else ""))
+            elif ev.type == EventType.PEER_MERGED:
+                print(f"[{ts}] диалоги {d[0][:8]} и {d[1][:8]} объединены")
             elif ev.type == EventType.REACTION:
                 peer = self.core.registry.get(d[1])
                 if d[2]:
