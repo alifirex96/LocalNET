@@ -12,13 +12,14 @@ from pathlib import Path
 from typing import Optional
 
 from . import APP_NAME, __version__
+from .bans import Ban, BanList, load_trusted_key
 from .config import Config
 from .discovery import Discovery, PeerRegistry
 from .file_transfer import ACCEPT_TIMEOUT, FileTransferManager
 from .history import HistoryStore, history_path_for
 from .messaging import Messenger
 from .models import ALL_CHAT, REACTIONS, AppEvent, ChatMessage, EventType, FileOffer, Peer, Transfer
-from .utils import guess_local_ip, user_config_dir
+from .utils import app_dir, guess_local_ip, local_ident, user_config_dir
 
 log = logging.getLogger(__name__)
 
@@ -59,6 +60,21 @@ class LocalNetCore:
         # История и постоянный ID узла (чтобы после перезапуска переписка продолжалась).
         self.history = HistoryStore(history_path_for(config.path), enabled=config.save_history)
         self.node_id = self.history.node_id()
+        self.ident = local_ident()
+        # Блокировки: доверяем только списку, подписанному ключом администратора.
+        dirs = [user_config_dir(), app_dir()]
+        if config.path:
+            dirs.insert(0, Path(config.path).parent)
+        self.admin_key = load_trusted_key(config.admin_public_key, dirs)
+        self.banlist = BanList()
+        self._bans_lock = threading.Lock()
+        stored = self.history.load_bans()
+        if stored:
+            bl = BanList.from_wire(stored)
+            if bl is not None and bl.verify(self.admin_key):
+                self.banlist = bl
+        if self.admin_key:
+            log.info("Ключ администратора: %s…, блокировок в списке: %d", self.admin_key[:12], len(self.banlist.bans))
         self._saved_transfer_state: dict[str, str] = {}
         self.events: "queue.Queue[AppEvent]" = queue.Queue()
         self.registry = PeerRegistry()
@@ -78,6 +94,8 @@ class LocalNetCore:
             on_failed=lambda mid, pid: self._on_receipt(mid, pid, "failed", EventType.MESSAGE_FAILED),
             on_read=self._on_read,
             on_reaction=self._on_reaction,
+            on_delete=self._on_delete,
+            on_bans=self._on_bans,
             transport=config.transport,
         )
         self.files = FileTransferManager(
@@ -116,6 +134,8 @@ class LocalNetCore:
             on_peer_updated=self._on_peer_updated,
             on_peer_offline=self._on_peer_offline,
             on_peer_removed=lambda p: self._emit(EventType.PEER_REMOVED, p),
+            ident=self.ident,
+            get_ban_version=lambda: self.banlist.version,
         )
         try:
             self.discovery.start()
@@ -138,7 +158,7 @@ class LocalNetCore:
         self.messenger.stop()
         now = time.time()
         for peer in self.registry.online():
-            self.history.upsert_contact(peer.node_id, peer.nickname, peer.ip, now)
+            self.history.upsert_contact(peer.node_id, peer.nickname, peer.ip, now, peer.ident)
         self.history.close()
         log.info("Остановлено")
 
@@ -169,7 +189,84 @@ class LocalNetCore:
         except OSError as exc:
             log.warning("Не удалось сохранить настройки: %s", exc)
 
+    # ------------------------------------------------------------------ блокировки
+
+    def ban_of(self, node_id: str, ident: str = "") -> Optional[Ban]:
+        """Действующая блокировка пользователя (по ID узла или отпечатку), если есть."""
+        if not ident:
+            peer = self.registry.get(node_id)
+            ident = peer.ident if peer else self.history.contact_ident(node_id)
+        with self._bans_lock:
+            return self.banlist.find(node_id, ident)
+
+    def is_banned(self, node_id: str, ident: str = "") -> bool:
+        return self.ban_of(node_id, ident) is not None
+
+    def my_ban(self) -> Optional[Ban]:
+        with self._bans_lock:
+            return self.banlist.find(self.node_id, self.ident)
+
+    def _check_can_send(self, to: Optional[str]) -> None:
+        ban = self.my_ban()
+        if ban is not None:
+            raise ValueError(f"Вы заблокированы администратором {ban.describe()}"
+                             + (f": {ban.reason}" if ban.reason else ""))
+        if to is not None and self.is_banned(to):
+            raise ValueError("Пользователь заблокирован администратором")
+
+    def _on_bans(self, sender: str, obj: dict) -> None:
+        bl = BanList.from_wire(obj)
+        if bl is None or not bl.verify(self.admin_key):
+            log.debug("Список блокировок от %s отклонён: неверная подпись или не задан ключ администратора",
+                      sender[:8])
+            return
+        with self._bans_lock:
+            if bl.version <= self.banlist.version:
+                return
+            self.banlist = bl
+        self.history.save_bans(bl.to_wire())
+        log.info("Получен список блокировок версии %d (%d записей)", bl.version, len(bl.bans))
+        if self.discovery is not None:
+            self.discovery.announce_now()
+        # Передаём дальше тем, у кого версия старее.
+        self._share_bans([p for p in self.registry.online() if p.ban_version < bl.version and p.node_id != sender])
+        self._emit(EventType.BANS_UPDATED, bl)
+
+    def _share_bans(self, peers: list[Peer]) -> None:
+        with self._bans_lock:
+            bl = self.banlist
+        if bl.version and peers:
+            self.messenger.send_bans(bl.to_wire(), [p.node_id for p in peers])
+
+    # ------------------------------------------------------------------ удаление
+
+    def delete_messages(self, msg_ids: list[str], for_all: bool = False) -> list[str]:
+        """Удалить сообщения у себя; ``for_all`` — свои сообщения ещё и у собеседников."""
+        convs = {m: self.history.message_conv(m) for m in msg_ids}
+        own = [m for m in msg_ids if self.history.message_sender(m) == self.node_id]
+        deleted = self.history.delete_messages(list(msg_ids))
+        if for_all and own:
+            by_conv: dict[str, list[str]] = {}
+            for m in own:
+                by_conv.setdefault(convs.get(m) or ALL_CHAT, []).append(m)
+            for conv, ids in by_conv.items():
+                targets = [p.node_id for p in self.registry.online()] if conv == ALL_CHAT else [conv]
+                self.messenger.send_delete(ids, targets)
+        return deleted
+
+    def delete_conversation(self, conv: str) -> None:
+        self.history.delete_conversation(conv)
+
+    def _on_delete(self, sender: str, msg_ids: list) -> None:
+        # Удалить можно только свои сообщения: проверяем автора по истории.
+        deleted = self.history.delete_messages(list(msg_ids), only_sender=sender)
+        if deleted:
+            self._emit(EventType.MESSAGES_DELETED, deleted)
+
+    # ------------------------------------------------------------------ отправка
+
     def send_message(self, text: str, to: Optional[str] = None) -> ChatMessage:
+        self._check_can_send(to)
         targets = len(self.registry.online()) if to is None else 1
         msg = self.messenger.send(text, to)
         self.history.add_message(msg, targets)
@@ -202,6 +299,7 @@ class LocalNetCore:
         self.messenger.send_reaction(msg_id, code, targets)
 
     def send_file(self, peer_id: str, path: str) -> Transfer:
+        self._check_can_send(peer_id)
         peer = self.registry.get(peer_id)
         if peer is None:
             raise ValueError("Пир не найден")
@@ -219,14 +317,27 @@ class LocalNetCore:
 
     def _on_peer_offline(self, peer: Peer) -> None:
         self.messenger.forget_peer(peer.node_id)
-        self.history.upsert_contact(peer.node_id, peer.nickname, peer.ip, peer.last_seen)
+        self.history.upsert_contact(peer.node_id, peer.nickname, peer.ip, peer.last_seen, peer.ident)
         self._emit(EventType.PEER_OFFLINE, peer)
 
     def _on_peer_updated(self, peer: Peer) -> None:
-        self.history.upsert_contact(peer.node_id, peer.nickname, peer.ip, peer.last_seen)
+        # Тот же человек под другим ID узла (другая копия программы, переустановка):
+        # переносим переписку в один диалог, чтобы не было дублей.
+        online_ids = {p.node_id for p in self.registry.online()}
+        for old in self.history.find_duplicates(peer.node_id, peer.ident, peer.nickname, peer.ip):
+            if old in online_ids:
+                continue  # два экземпляра одновременно в сети — это не дубль
+            self.history.merge_contact(old, peer.node_id)
+            self._emit(EventType.PEER_MERGED, (old, peer.node_id))
+        self.history.upsert_contact(peer.node_id, peer.nickname, peer.ip, peer.last_seen, peer.ident)
+        if peer.ban_version < self.banlist.version:
+            self._share_bans([peer])
         self._emit(EventType.PEER_UPDATED, peer)
 
     def _on_message(self, msg: ChatMessage) -> None:
+        if self.is_banned(msg.sender_id):
+            log.info("Сообщение от заблокированного пользователя %s отброшено", msg.sender_nick)
+            return
         self.history.add_message(msg)
         self._emit(EventType.MESSAGE, msg)
 
@@ -257,6 +368,9 @@ class LocalNetCore:
         return "неизвестный", ip
 
     def _on_offer(self, offer: FileOffer) -> bool:
+        if self.is_banned(offer.transfer.peer_id):
+            log.info("Файл от заблокированного пользователя %s отклонён", offer.transfer.peer_nick)
+            return False
         if self.config.auto_accept:
             return True
         self._emit(EventType.FILE_OFFER, offer)

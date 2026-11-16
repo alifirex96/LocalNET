@@ -22,6 +22,7 @@ log = logging.getLogger("localnet")
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(prog="localnet", description=f"{APP_NAME} — LAN-мессенджер и файлообменник")
     p.add_argument("--cli", action="store_true", help="консольный режим вместо GUI")
+    p.add_argument("--admin", action="store_true", help="админ-панель: блокировка пользователей")
     p.add_argument("--config", help="путь к файлу настроек JSON")
     p.add_argument("--nickname", help="ник (сохраняется в настройках)")
     p.add_argument("--msg-port", type=int, help="TCP-порт сообщений")
@@ -76,6 +77,9 @@ EXIT_ERROR_SHOWN = 3
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.admin:
+        from localnet.admin import main as admin_main
+        return admin_main(["--config", args.config] if args.config else [])
     log_file = user_config_dir() / "logs" / "localnet.log"
     try:
         return _run(args)
