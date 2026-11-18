@@ -39,7 +39,8 @@ CREATE TABLE IF NOT EXISTS contacts (
 CREATE TABLE IF NOT EXISTS messages (
     msg_id TEXT PRIMARY KEY, conv TEXT NOT NULL, sender_id TEXT NOT NULL, sender_nick TEXT NOT NULL,
     text TEXT NOT NULL, recipient TEXT, ts REAL NOT NULL, outgoing INTEGER NOT NULL,
-    targets INTEGER NOT NULL DEFAULT 1, read_sent INTEGER NOT NULL DEFAULT 0);
+    targets INTEGER NOT NULL DEFAULT 1, read_sent INTEGER NOT NULL DEFAULT 0,
+    queued INTEGER NOT NULL DEFAULT 0);
 CREATE INDEX IF NOT EXISTS messages_conv_ts ON messages (conv, ts);
 CREATE TABLE IF NOT EXISTS receipts (
     msg_id TEXT NOT NULL, peer_id TEXT NOT NULL, kind TEXT NOT NULL, ts REAL NOT NULL,
@@ -54,6 +55,8 @@ CREATE TABLE IF NOT EXISTS transfers (
     speed REAL, offset INTEGER);
 CREATE INDEX IF NOT EXISTS transfers_conv ON transfers (conv, started);
 """
+
+_MESSAGE_COLUMNS = "msg_id, sender_id, sender_nick, text, recipient, ts, outgoing, targets, read_sent, queued"
 
 
 def history_path_for(config_path: Optional[str]) -> Optional[Path]:
@@ -91,7 +94,8 @@ class HistoryStore:
 
     def __init__(self, path: Optional[Path], enabled: bool = True) -> None:
         self.path = path
-        self.enabled = enabled
+        self.persistent = False
+        self.enabled = False
         self._lock = threading.RLock()
         self._db = None
         target = ":memory:"
@@ -108,6 +112,11 @@ class HistoryStore:
         try:
             self._db = sqlite3.connect(target, check_same_thread=False, timeout=5)
             self._db.executescript(_SCHEMA)
+            self._db.create_function("casefold", 1, str.casefold)
+            self._db.execute("BEGIN IMMEDIATE")
+            if not any(row[1] == "queued" for row in self._db.execute("PRAGMA table_info(messages)")):
+                self._db.execute("ALTER TABLE messages ADD COLUMN queued INTEGER NOT NULL DEFAULT 0")
+            self._db.commit()
             for pragma in ("PRAGMA journal_mode=WAL", "PRAGMA synchronous=NORMAL"):
                 try:
                     self._db.execute(pragma)
@@ -117,10 +126,14 @@ class HistoryStore:
             self._db.commit()
         except sqlite3.DatabaseError as exc:
             log.error("Файл истории %s повреждён или недоступен (%s) — используется временная история", path, exc)
+            if self._db is not None:
+                self._db.close()
             self._db = sqlite3.connect(":memory:", check_same_thread=False)
             self._db.executescript(_SCHEMA)
-        if target == ":memory:":
-            self.enabled = False
+            self._db.create_function("casefold", 1, str.casefold)
+            target = ":memory:"
+        self.persistent = target != ":memory:"
+        self.enabled = enabled and self.persistent
 
     # ------------------------------------------------------------------ служебное
 
@@ -187,15 +200,49 @@ class HistoryStore:
             return ALL_CHAT
         return msg.to if msg.outgoing else msg.sender_id
 
-    def add_message(self, msg: ChatMessage, targets: int = 1) -> None:
-        if self._store():
-            self._exec("INSERT OR IGNORE INTO messages VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
-                       (msg.msg_id, self.conv_of(msg), msg.sender_id, msg.sender_nick, msg.text, msg.to,
-                        msg.ts, int(msg.outgoing), targets))
+    def add_message(self, msg: ChatMessage, targets: int = 1) -> Optional[bool]:
+        """False для дубля, None если сообщение не сохранено."""
+        with self._lock:
+            if not self._store():
+                return None
+            try:
+                with self._db:
+                    cursor = self._db.execute(
+                        f"INSERT OR IGNORE INTO messages (conv, {_MESSAGE_COLUMNS}) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
+                        (self.conv_of(msg), msg.msg_id, msg.sender_id, msg.sender_nick, msg.text,
+                         msg.to, msg.ts, int(msg.outgoing), targets, int(msg.queued)))
+                return cursor.rowcount == 1
+            except sqlite3.DatabaseError as exc:
+                log.warning("Не удалось сохранить сообщение: %s", exc)
+                return None
+
+    def pending_messages(self, node_id: str) -> list[ChatMessage]:
+        rows = self._exec(
+            f"SELECT {_MESSAGE_COLUMNS} FROM messages m WHERE queued=1 AND sender_id=? "
+            "AND NOT EXISTS (SELECT 1 FROM receipts r WHERE r.msg_id=m.msg_id "
+            "AND r.peer_id=m.recipient AND r.kind IN ('delivered', 'read')) ORDER BY ts, rowid",
+            (node_id,), commit=False)
+        return [self._stored_message(row, row[4]).msg for row in rows]
 
     def add_receipt(self, msg_id: str, peer_id: str, kind: str) -> None:
         if self._store():
             self._exec("INSERT OR IGNORE INTO receipts VALUES (?, ?, ?, ?)", (msg_id, peer_id, kind, time.time()))
+
+    def confirm_queued(self, msg_id: str, peer_id: str, kind: str) -> bool:
+        """Подтверждаем и ранее сохранённую очередь при выключенной истории."""
+        with self._lock:
+            if not self.persistent or self._db is None:
+                return True
+            try:
+                with self._db:
+                    self._db.execute(
+                        "INSERT OR IGNORE INTO receipts SELECT msg_id, recipient, ?, ? FROM messages "
+                        "WHERE msg_id=? AND recipient=? AND queued=1", (kind, time.time(), msg_id, peer_id))
+                return True
+            except sqlite3.DatabaseError as exc:
+                log.warning("Не удалось сохранить подтверждение из очереди: %s", exc)
+                return False
 
     def set_reaction(self, msg_id: str, peer_id: str, code: str) -> None:
         if not self._store():
@@ -230,13 +277,43 @@ class HistoryStore:
 
     def load_messages(self, conv: str, limit: int = 500) -> list[StoredMessage]:
         rows = self._exec(
-            "SELECT * FROM (SELECT msg_id, sender_id, sender_nick, text, recipient, ts, outgoing, targets, read_sent "
-            "FROM messages WHERE conv=? ORDER BY ts DESC LIMIT ?) ORDER BY ts", (conv, limit), commit=False)
-        result: dict[str, StoredMessage] = {}
-        for msg_id, sender_id, nick, text, to, ts, outgoing, targets, read_sent in rows:
-            msg = ChatMessage(msg_id=msg_id, sender_id=sender_id, sender_nick=nick, text=text, to=to, ts=ts,
-                              outgoing=bool(outgoing))
-            result[msg_id] = StoredMessage(msg, conv, targets, bool(read_sent))
+            f"SELECT {_MESSAGE_COLUMNS} FROM (SELECT *, rowid AS position FROM messages "
+            "WHERE conv=? ORDER BY ts DESC, rowid DESC LIMIT ?) ORDER BY ts, position", (conv, limit), commit=False)
+        return self._load_message_details(rows, conv)
+
+    def search_messages(self, conv: str, query: str, limit: int = 100) -> list[ChatMessage]:
+        query = query.strip().casefold()
+        if not query:
+            return []
+        rows = self._exec(
+            f"SELECT {_MESSAGE_COLUMNS} FROM messages WHERE conv=? "
+            "AND INSTR(casefold(text), ?) > 0 ORDER BY ts DESC, rowid DESC LIMIT ?",
+            (conv, query, limit), commit=False)
+        return [self._stored_message(row, conv).msg for row in rows]
+
+    def load_around(self, conv: str, msg_id: str, limit: int = 25) -> list[StoredMessage]:
+        with self._lock:
+            anchor = self._exec("SELECT ts, rowid FROM messages WHERE conv=? AND msg_id=?",
+                                (conv, msg_id), commit=False)
+            if not anchor:
+                return []
+            before = self._exec(
+                f"SELECT {_MESSAGE_COLUMNS} FROM messages WHERE conv=? AND (ts, rowid) <= (?, ?) "
+                "ORDER BY ts DESC, rowid DESC LIMIT ?", (conv, *anchor[0], limit + 1), commit=False)
+            after = self._exec(
+                f"SELECT {_MESSAGE_COLUMNS} FROM messages WHERE conv=? AND (ts, rowid) > (?, ?) "
+                "ORDER BY ts, rowid LIMIT ?", (conv, *anchor[0], limit), commit=False)
+            return self._load_message_details(list(reversed(before)) + after, conv)
+
+    @staticmethod
+    def _stored_message(row: tuple, conv: str) -> StoredMessage:
+        msg_id, sender_id, nick, text, to, ts, outgoing, targets, read_sent, queued = row
+        msg = ChatMessage(msg_id=msg_id, sender_id=sender_id, sender_nick=nick, text=text, to=to, ts=ts,
+                          outgoing=bool(outgoing), queued=bool(queued))
+        return StoredMessage(msg, conv, targets, bool(read_sent))
+
+    def _load_message_details(self, rows: list, conv: str) -> list[StoredMessage]:
+        result = {row[0]: self._stored_message(row, conv) for row in rows}
         if result:
             ids = list(result)
             for i in range(0, len(ids), 500):
@@ -256,18 +333,18 @@ class HistoryStore:
     def upsert_transfer(self, t: Transfer) -> None:
         if self._store():
             self._exec("INSERT OR REPLACE INTO transfers VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                       (t.transfer_id, t.peer_id, t.direction.value, t.peer_id, t.peer_nick, t.peer_ip, t.name,
+                       (t.transfer_id, t.conversation, t.direction.value, t.peer_id, t.peer_nick, t.peer_ip, t.name,
                         t.size, t.path, t.sha256, t.state.name, t.error, t.started, t.finished_at, t.speed,
                         t.offset))
 
     def load_transfers(self, conv: Optional[str] = None, limit: int = 500) -> list[Transfer]:
         where, args = ("WHERE conv=?", [conv]) if conv is not None else ("", [])
         rows = self._exec(
-            f"SELECT * FROM (SELECT transfer_id, direction, peer_id, peer_nick, peer_ip, name, size, path, sha256, "
+            f"SELECT * FROM (SELECT transfer_id, conv, direction, peer_id, peer_nick, peer_ip, name, size, path, sha256, "
             f"state, error, started, finished, speed, offset FROM transfers {where} ORDER BY started DESC LIMIT ?) "
             f"ORDER BY started", [*args, limit], commit=False)
         result = []
-        for (tid, direction, peer_id, nick, ip, name, size, path, sha, state, error, started, finished, speed,
+        for (tid, key, direction, peer_id, nick, ip, name, size, path, sha, state, error, started, finished, speed,
              offset) in rows:
             try:
                 st = TransferState[state]
@@ -279,7 +356,7 @@ class HistoryStore:
             t = Transfer(transfer_id=tid, direction=TransferDirection(direction), peer_id=peer_id, peer_nick=nick,
                          peer_ip=ip or "", name=name, size=size, path=path or "", sha256=sha or "", state=st,
                          done=size if st == TransferState.DONE else 0, offset=offset or 0, started=started,
-                         finished_at=finished or 0.0, speed=speed or 0.0, error=error or "")
+                         finished_at=finished or 0.0, speed=speed or 0.0, error=error or "", group=key == ALL_CHAT)
             result.append(t)
         return result
 
@@ -307,7 +384,15 @@ class HistoryStore:
                 out[conv] = (ts, ("↑ " if direction == "send" else "↓ ") + name)
         return out
 
-    def clear(self) -> None:
+    def clear(self) -> bool:
         """Удалить всю переписку (ID узла и контакты сохраняются)."""
-        for table in ("messages", "receipts", "reactions", "transfers"):
-            self._exec(f"DELETE FROM {table}")
+        with self._lock:
+            if self._db is not None:
+                try:
+                    with self._db:
+                        for table in ("messages", "receipts", "reactions", "transfers"):
+                            self._db.execute(f"DELETE FROM {table}")
+                except sqlite3.DatabaseError as exc:
+                    log.warning("Не удалось очистить историю: %s", exc)
+                    return False
+            return True

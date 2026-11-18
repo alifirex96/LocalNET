@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 from . import PROTOCOL_VERSION, __version__
+from .media import avatar_pixels
 from .models import Peer
 from .utils import canonical_json, sign, verify
 
@@ -51,6 +52,7 @@ class Presence:
     file_port: int
     version: str
     ts: float
+    avatar: str = ""
 
 
 def build_packet(
@@ -61,6 +63,8 @@ def build_packet(
     secret: str = "",
     ptype: str = "hello",
     ts: Optional[float] = None,
+    *,
+    avatar: str = "",
 ) -> bytes:
     pkt = {
         "magic": MAGIC,
@@ -73,8 +77,14 @@ def build_packet(
         "version": __version__,
         "ts": round(time.time() if ts is None else ts, 3),
     }
+    if ptype == "hello" and avatar_pixels(avatar):
+        pkt["avatar"] = avatar
     pkt["sig"] = sign(pkt, secret)
     data = canonical_json(pkt)
+    if len(data) > MAX_PACKET and "avatar" in pkt:
+        del pkt["avatar"]
+        pkt["sig"] = sign(pkt, secret)
+        data = canonical_json(pkt)
     if len(data) > MAX_PACKET:  # pragma: no cover - ник обрезан, сюда не попадаем
         raise ValueError("Пакет присутствия слишком большой")
     return data
@@ -116,6 +126,7 @@ def parse_packet(data: bytes, secret: str = "", now: Optional[float] = None) -> 
         if abs(current - float(ts)) > MAX_CLOCK_SKEW:
             return None
     version = obj.get("version")
+    avatar = obj.get("avatar", "")
     return Presence(
         type=ptype,
         node_id=node_id,
@@ -124,6 +135,7 @@ def parse_packet(data: bytes, secret: str = "", now: Optional[float] = None) -> 
         file_port=obj["file_port"],
         version=version if isinstance(version, str) else "",
         ts=float(ts),
+        avatar=avatar if avatar_pixels(avatar) else "",
     )
 
 
@@ -188,6 +200,7 @@ class PeerRegistry:
                     version=presence.version,
                     last_seen=now,
                     online=True,
+                    avatar=presence.avatar,
                 )
                 self._peers[peer.node_id] = peer
                 return peer, True, removed
@@ -197,12 +210,14 @@ class PeerRegistry:
                 or peer.ip != ip
                 or peer.msg_port != presence.msg_port
                 or peer.file_port != presence.file_port
+                or peer.avatar != presence.avatar
             )
             peer.nickname = presence.nickname
             peer.ip = ip
             peer.msg_port = presence.msg_port
             peer.file_port = presence.file_port
             peer.version = presence.version
+            peer.avatar = presence.avatar
             peer.last_seen = now
             peer.online = True
             return peer, changed, removed
@@ -250,6 +265,7 @@ class Discovery:
         on_peer_updated: Optional[Callable[[Peer], None]] = None,
         on_peer_offline: Optional[Callable[[Peer], None]] = None,
         on_peer_removed: Optional[Callable[[Peer], None]] = None,
+        get_avatar: Optional[Callable[[], str]] = None,
     ) -> None:
         self.node_id = node_id
         self.get_nickname = get_nickname
@@ -266,6 +282,7 @@ class Discovery:
         self.on_peer_updated = on_peer_updated
         self.on_peer_offline = on_peer_offline
         self.on_peer_removed = on_peer_removed
+        self.get_avatar = get_avatar
 
         self._stop = threading.Event()
         self._announce_now = threading.Event()
@@ -340,7 +357,7 @@ class Discovery:
 
     def _packet(self, ptype: str = "hello") -> bytes:
         return build_packet(self.node_id, self.get_nickname(), self.msg_port, self.file_port,
-                            self.secret, ptype)
+                            self.secret, ptype, avatar=self.get_avatar() if self.get_avatar else "")
 
     def _send_all(self, data: bytes) -> None:
         if self._send_sock is None:

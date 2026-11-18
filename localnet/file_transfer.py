@@ -319,7 +319,7 @@ class FileTransferManager:
                 pass
         return True
 
-    def send_file(self, peer: Peer, path: str | os.PathLike) -> Transfer:
+    def send_file(self, peer: Peer, path: str | os.PathLike, *, group: bool = False) -> Transfer:
         """Запускает отправку файла пиру в фоновом потоке."""
         p = Path(path)
         if not p.is_file():
@@ -333,6 +333,7 @@ class FileTransferManager:
             name=p.name,
             size=p.stat().st_size,
             path=str(p),
+            group=group,
         )
         with self._lock:
             self._transfers[t.transfer_id] = t
@@ -406,6 +407,8 @@ class FileTransferManager:
                 "size": t.size,
                 "sha256": t.sha256,
             }
+            if t.group:
+                offer["group"] = True
             offer["sig"] = sign(offer, self.secret)
             sock.sendall(MAGIC)
             send_frame(sock, offer)
@@ -499,6 +502,7 @@ class FileTransferManager:
                 size=offer["size"],
                 sha256=offer["sha256"],
                 state=TransferState.WAITING_ACCEPT,
+                group=offer.get("group") is True,
             )
             with self._lock:
                 if t.transfer_id in self._transfers:

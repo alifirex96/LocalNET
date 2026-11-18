@@ -1,5 +1,6 @@
 """Тесты разбора пакетов discovery и таблицы пиров."""
 
+import base64
 import json
 import time
 
@@ -101,6 +102,22 @@ def test_missing_field_rejected():
 def test_secret_valid_signature():
     data = build_packet(NODE, "x", 45893, 45894, secret="s3cr3t")
     assert parse_packet(data, secret="s3cr3t") is not None
+
+
+def test_custom_avatar_is_signed_and_updates_peer():
+    avatar = base64.b64encode(bytes(range(256))).decode("ascii")
+    data = build_packet(NODE, "Вася", 45893, 45894, secret="s", avatar=avatar)
+    assert len(data) <= MAX_PACKET
+    presence = parse_packet(data, secret="s")
+    assert presence.avatar == avatar
+    modified = json.loads(data)
+    modified["avatar"] = ""
+    assert parse_packet(_enc(modified), secret="s") is None
+    registry = PeerRegistry()
+    old = parse_packet(build_packet(NODE, "Вася", 45893, 45894))
+    registry.update(old, "10.0.0.2")
+    peer, changed, _ = registry.update(presence, "10.0.0.2")
+    assert changed and peer.avatar == avatar
 
 
 def test_secret_mismatch_rejected():

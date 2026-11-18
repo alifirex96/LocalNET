@@ -1,5 +1,6 @@
 """Тесты хранилища истории переписки."""
 
+import sqlite3
 import time
 
 import localnet.history as history_mod
@@ -85,6 +86,32 @@ def test_load_limit_returns_latest(tmp_path):
         h.add_message(_msg(i))
     got = h.load_messages(ALL_CHAT, limit=5)
     assert [s.msg.text for s in got] == [f"сообщение {i}" for i in range(15, 20)]
+
+
+def test_search_finds_older_cyrillic_message_and_context(tmp_path):
+    with sqlite3.connect(tmp_path / "h.db") as db:
+        db.executescript("""
+            CREATE TABLE messages (
+                msg_id TEXT PRIMARY KEY, conv TEXT NOT NULL, sender_id TEXT NOT NULL,
+                sender_nick TEXT NOT NULL, text TEXT NOT NULL, recipient TEXT, ts REAL NOT NULL,
+                outgoing INTEGER NOT NULL, targets INTEGER NOT NULL, read_sent INTEGER NOT NULL);
+            INSERT INTO messages VALUES
+                ('old', '__all__', 'bob', 'Боб', 'ОТЧЁТ готов: 50%_выполнено', NULL, 999, 0, 1, 0);
+        """)
+    h = HistoryStore(tmp_path / "h.db")
+    try:
+        for i in range(8):
+            h.add_message(_msg(i))
+        h.add_message(_msg(9, to=ME, text="Отчёт из другого чата"))
+        assert all(row.msg.msg_id != "old" for row in h.load_messages(ALL_CHAT, limit=3))
+        assert [msg.msg_id for msg in h.search_messages(ALL_CHAT, "  отчёт  ")] == ["old"]
+        assert [msg.msg_id for msg in h.search_messages(ALL_CHAT, "50%_")] == ["old"]
+        assert h.search_messages(ALL_CHAT, "%несовпадение_") == []
+        rows = h.load_around(ALL_CHAT, "old", limit=2)
+        assert [row.msg.msg_id for row in rows] == ["old", _msg(0).msg_id, _msg(1).msg_id]
+        assert not rows[0].msg.queued
+    finally:
+        h.close()
 
 
 def _transfer(tid="t" * 32, state=TransferState.DONE, started=2000.0):

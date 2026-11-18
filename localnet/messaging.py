@@ -185,12 +185,17 @@ class BaseMessenger:
 
     def send(self, text: str, to: Optional[str] = None) -> ChatMessage:
         """Ставит сообщение в очередь. ``to=None`` — всем online-пирам."""
-        text = text.strip()
-        if not text:
+        msg = self.prepare_message(text, to)
+        self.submit_message(msg)
+        return msg
+
+    def prepare_message(self, text: str, to: Optional[str] = None) -> ChatMessage:
+        text = text.strip("\r\n ") if "\t" in text else text.strip()
+        if not text.strip():
             raise ValueError("Пустое сообщение")
         if len(text) > MAX_TEXT:
             raise ValueError(f"Сообщение длиннее {MAX_TEXT} символов")
-        msg = ChatMessage(
+        return ChatMessage(
             msg_id=new_id(),
             sender_id=self.node_id,
             sender_nick=self.get_nickname(),
@@ -198,8 +203,9 @@ class BaseMessenger:
             to=to,
             outgoing=True,
         )
+
+    def submit_message(self, msg: ChatMessage) -> None:
         self._submit(msg)
-        return msg
 
     def _submit(self, msg: ChatMessage) -> None:  # pragma: no cover - переопределяется
         raise NotImplementedError
