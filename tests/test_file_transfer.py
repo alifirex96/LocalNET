@@ -21,7 +21,8 @@ from localnet.file_transfer import (
     send_frame,
     validate_offer,
 )
-from localnet.models import Peer, TransferState
+from localnet.history import HistoryStore
+from localnet.models import ALL_CHAT, Peer, TransferState
 from localnet.utils import Cancelled, safe_filename, sha256_file, sign, unique_path
 
 
@@ -278,6 +279,23 @@ def test_full_transfer_success(tmp_path, pair_factory):
     assert not list(pair.dl.glob("*.part"))
     states = [u.state for u in pair.updates if u.direction.value == "send"]
     assert TransferState.HASHING in states and TransferState.TRANSFERRING in states
+
+
+def test_group_file_arrives_in_general_chat_and_stays_there(tmp_path, pair_factory):
+    src = tmp_path / "report.txt"
+    src.write_text("Отчёт", encoding="utf-8")
+    pair = pair_factory(sender_secret="shared", receiver_secret="shared")
+    sent, received = pair.wait(pair.sender.send_file(pair.peer, src, group=True))
+    assert sent.state == received.state == TransferState.DONE
+    assert sent.conversation == received.conversation == ALL_CHAT
+    history = HistoryStore(tmp_path / "history.db")
+    try:
+        history.upsert_transfer(received)
+        assert history.load_transfers(received.peer_id) == []
+        saved, = history.load_transfers(ALL_CHAT)
+        assert saved.group and saved.path == received.path
+    finally:
+        history.close()
 
 
 def test_empty_file(tmp_path, pair_factory):

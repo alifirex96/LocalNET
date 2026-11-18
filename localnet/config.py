@@ -20,6 +20,7 @@ from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any, Optional
 
+from .media import avatar_pixels
 from .utils import app_dir, default_download_dir, user_config_dir
 
 log = logging.getLogger(__name__)
@@ -74,11 +75,13 @@ class Config:
     transport: str = "auto"
     # Сохранять историю переписки на диске (файл <имя конфига>.history.db рядом с настройками).
     save_history: bool = True
-    # Свои сообщения справа (по умолчанию все сообщения слева, свои — зелёные).
+    # Свои сообщения справа (по умолчанию все сообщения слева).
     own_messages_right: bool = False
     # Открытый ключ администратора (hex). Списки блокировок принимаются только с его подписью.
     # Можно не заполнять, а положить файл localnet-admin.pub рядом с программой или настройками.
     admin_public_key: str = ""
+    avatar: str = ""
+    check_updates: bool = True
 
     # Путь, откуда загружен конфиг (не сохраняется в файл).
     path: Optional[str] = field(default=None, repr=False, compare=False)
@@ -108,6 +111,10 @@ class Config:
             self.broadcast_addresses = [self.broadcast_addresses]
         if isinstance(self.static_peers, str):
             self.static_peers = [self.static_peers]
+        if not avatar_pixels(self.avatar):
+            self.avatar = ""
+        if not isinstance(self.check_updates, bool):
+            self.check_updates = True
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)

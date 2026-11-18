@@ -76,10 +76,10 @@ class CliApp:
             elif cmd == "/peers":
                 self._print_peers()
             elif cmd == "/msg" and len(args) >= 2:
-                peer = self._peer(args[0])
-                if peer:
+                peer_id = self._message_recipient(args[0])
+                if peer_id:
                     text = line.split(None, 2)[2] if len(line.split(None, 2)) > 2 else " ".join(args[1:])
-                    self._send(text, peer.node_id)
+                    self._send(text, peer_id)
             elif cmd == "/send" and len(args) >= 2:
                 peer = self._peer(args[0])
                 if peer:
@@ -119,7 +119,9 @@ class CliApp:
 
     def _send(self, text: str, to) -> None:
         try:
-            self.core.send_message(text, to)
+            msg = self.core.send_message(text, to)
+            if msg.queued:
+                print("Личное сообщение в очереди доставки.")
         except ValueError as exc:
             print(f"Ошибка: {exc}")
 
@@ -128,6 +130,18 @@ class CliApp:
         if peer is None:
             print(f"Пир «{query}» не найден. /peers — список.")
         return peer
+
+    def _message_recipient(self, query: str):
+        peer = self.core.registry.find(query)
+        if peer is not None:
+            return peer.node_id
+        q = query.casefold()
+        matches = [node_id for node_id, (name, ip, _) in self.core.history.contacts().items()
+                   if node_id.startswith(q) or name.casefold() == q or ip == q]
+        if len(matches) == 1:
+            return matches[0]
+        print(f"Не удалось однозначно найти «{query}». Укажите имя или ID устройства.")
+        return None
 
     @staticmethod
     def _match(prefix: str, ids: list[str]):
@@ -180,6 +194,9 @@ class CliApp:
             elif ev.type == EventType.MESSAGE_FAILED:
                 peer = self.core.registry.get(d[1])
                 print(f"[{ts}] ! сообщение не доставлено: {peer.nickname if peer else d[1][:8]}")
+            elif ev.type == EventType.MESSAGE_DELIVERED:
+                peer = self.core.registry.get(d[1])
+                print(f"[{ts}] ✓✓ сообщение доставлено: {peer.nickname if peer else d[1][:8]}")
             elif ev.type == EventType.FILE_OFFER:
                 t = d.transfer
                 self.offers[t.transfer_id] = d

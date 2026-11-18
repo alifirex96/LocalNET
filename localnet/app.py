@@ -8,6 +8,7 @@ import queue
 import sys
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Optional
 
@@ -17,7 +18,7 @@ from .config import Config
 from .discovery import Discovery, PeerRegistry
 from .file_transfer import ACCEPT_TIMEOUT, FileTransferManager
 from .history import HistoryStore, history_path_for
-from .messaging import Messenger
+from .messaging import ACK_TIMEOUT, Messenger
 from .models import ALL_CHAT, REACTIONS, AppEvent, ChatMessage, EventType, FileOffer, Peer, Transfer
 from .utils import app_dir, guess_local_ip, local_ident, user_config_dir
 
@@ -25,6 +26,7 @@ log = logging.getLogger(__name__)
 
 # Получатель должен ответить раньше, чем у отправителя истечёт ACCEPT_TIMEOUT.
 OFFER_DECISION_TIMEOUT = ACCEPT_TIMEOUT - 20
+OUTBOX_RETRY_INTERVAL = ACK_TIMEOUT + 3
 
 
 def setup_logging(level: str = "INFO", log_dir: Optional[Path] = None) -> Path:
@@ -82,6 +84,9 @@ class LocalNetCore:
         self._nick_lock = threading.Lock()
         self._nickname = config.nickname
         self._started = False
+        self._outbox_lock = threading.RLock()
+        self._outbox = {msg.msg_id: (msg, 0.0) for msg in self.history.pending_messages(self.node_id)}
+        self._outbox_stop = threading.Event()
 
         self.messenger = Messenger(
             node_id=self.node_id,
@@ -136,6 +141,7 @@ class LocalNetCore:
             on_peer_removed=lambda p: self._emit(EventType.PEER_REMOVED, p),
             ident=self.ident,
             get_ban_version=lambda: self.banlist.version,
+            get_avatar=lambda: self.config.avatar,
         )
         try:
             self.discovery.start()
@@ -146,12 +152,17 @@ class LocalNetCore:
                                         f"для обнаружения: {exc}")
             self.discovery = None
         self._started = True
+        self._outbox_stop.clear()
+        self._outbox_thread = threading.Thread(target=self._run_outbox, name="message-outbox", daemon=True)
+        self._outbox_thread.start()
 
     def stop(self) -> None:
         if not self._started:
             return
         self._started = False
         log.info("Остановка…")
+        self._outbox_stop.set()
+        self._outbox_thread.join()
         if self.discovery is not None:
             self.discovery.stop()
         self.files.stop()
@@ -242,9 +253,13 @@ class LocalNetCore:
 
     def delete_messages(self, msg_ids: list[str], for_all: bool = False) -> list[str]:
         """Удалить сообщения у себя; ``for_all`` — свои сообщения ещё и у собеседников."""
-        convs = {m: self.history.message_conv(m) for m in msg_ids}
-        own = [m for m in msg_ids if self.history.message_sender(m) == self.node_id]
-        deleted = self.history.delete_messages(list(msg_ids))
+        with self._outbox_lock:
+            convs = {m: self.history.message_conv(m) for m in msg_ids}
+            own = [m for m in msg_ids if self.history.message_sender(m) == self.node_id]
+            deleted = self.history.delete_messages(list(msg_ids))
+            for msg_id in msg_ids:
+                if self._outbox.pop(msg_id, None) is not None and msg_id not in deleted:
+                    deleted.append(msg_id)
         if for_all and own:
             by_conv: dict[str, list[str]] = {}
             for m in own:
@@ -255,7 +270,9 @@ class LocalNetCore:
         return deleted
 
     def delete_conversation(self, conv: str) -> None:
-        self.history.delete_conversation(conv)
+        with self._outbox_lock:
+            self.history.delete_conversation(conv)
+            self._outbox = {msg_id: pending for msg_id, pending in self._outbox.items() if pending[0].to != conv}
 
     def _on_delete(self, sender: str, msg_ids: list) -> None:
         # Удалить можно только свои сообщения: проверяем автора по истории.
@@ -267,10 +284,47 @@ class LocalNetCore:
 
     def send_message(self, text: str, to: Optional[str] = None) -> ChatMessage:
         self._check_can_send(to)
-        targets = len(self.registry.online()) if to is None else 1
-        msg = self.messenger.send(text, to)
-        self.history.add_message(msg, targets)
+        msg = self.messenger.prepare_message(text, to)
+        if to is None:
+            self.history.add_message(msg, len(self.registry.online()))
+            self.messenger.submit_message(msg)
+            return msg
+        msg.queued = True
+        with self._outbox_lock:
+            saved = self.history.add_message(msg)
+            if saved is None and self.history.enabled:
+                raise ValueError("Не удалось сохранить сообщение в очереди")
+            self._outbox[msg.msg_id] = (msg, 0.0)
         return msg
+
+    def _run_outbox(self) -> None:
+        while not self._outbox_stop.is_set():
+            now = time.monotonic()
+            ready = []
+            with self._outbox_lock:
+                for msg_id, (msg, retry_at) in self._outbox.items():
+                    if retry_at > now:
+                        continue
+                    peer = self.registry.get(msg.to)
+                    if peer is not None and peer.online:
+                        self._outbox[msg_id] = (msg, now + OUTBOX_RETRY_INTERVAL)
+                        ready.append(msg)
+            for msg in ready:
+                if self._outbox_stop.is_set():
+                    return
+                with self._outbox_lock:
+                    pending = self._outbox.get(msg.msg_id)
+                    if pending is None or pending[0] is not msg:
+                        continue
+                    if self.my_ban() is None and not self.is_banned(msg.to):
+                        self.messenger.submit_message(msg)
+            self._outbox_stop.wait(0.5)
+
+    def clear_history(self) -> None:
+        with self._outbox_lock:
+            if not self.history.clear():
+                raise ValueError("Не удалось очистить историю переписки")
+            self._outbox.clear()
 
     def mark_read(self, conv: str) -> list[str]:
         """Отметить входящие сообщения чата прочитанными и сообщить об этом отправителям."""
@@ -298,14 +352,14 @@ class LocalNetCore:
             targets = [conv]
         self.messenger.send_reaction(msg_id, code, targets)
 
-    def send_file(self, peer_id: str, path: str) -> Transfer:
+    def send_file(self, peer_id: str, path: str, *, group: bool = False) -> Transfer:
         self._check_can_send(peer_id)
         peer = self.registry.get(peer_id)
         if peer is None:
             raise ValueError("Пир не найден")
         if not peer.online:
             raise ValueError(f"{peer.nickname} сейчас offline")
-        return self.files.send_file(peer, path)
+        return self.files.send_file(peer, path, group=group)
 
     def cancel_transfer(self, transfer_id: str) -> bool:
         return self.files.cancel(transfer_id)
@@ -327,7 +381,11 @@ class LocalNetCore:
         for old in self.history.find_duplicates(peer.node_id, peer.ident, peer.nickname, peer.ip):
             if old in online_ids:
                 continue  # два экземпляра одновременно в сети — это не дубль
-            self.history.merge_contact(old, peer.node_id)
+            with self._outbox_lock:
+                self.history.merge_contact(old, peer.node_id)
+                for msg_id, (msg, _) in self._outbox.items():
+                    if msg.to == old:
+                        self._outbox[msg_id] = (replace(msg, to=peer.node_id), 0.0)
             self._emit(EventType.PEER_MERGED, (old, peer.node_id))
         self.history.upsert_contact(peer.node_id, peer.nickname, peer.ip, peer.last_seen, peer.ident)
         if peer.ban_version < self.banlist.version:
@@ -338,16 +396,30 @@ class LocalNetCore:
         if self.is_banned(msg.sender_id):
             log.info("Сообщение от заблокированного пользователя %s отброшено", msg.sender_nick)
             return
-        self.history.add_message(msg)
-        self._emit(EventType.MESSAGE, msg)
+        if self.history.add_message(msg) is not False:
+            self._emit(EventType.MESSAGE, msg)
 
     def _on_receipt(self, msg_id: str, peer_id: str, kind: str, etype: EventType) -> None:
-        self.history.add_receipt(msg_id, peer_id, kind)
+        if not self._record_receipt(msg_id, peer_id, kind):
+            return
         self._emit(etype, (msg_id, peer_id))
+
+    def _record_receipt(self, msg_id: str, peer_id: str, kind: str) -> bool:
+        with self._outbox_lock:
+            pending = self._outbox.get(msg_id)
+            queued = pending is not None and pending[0].to == peer_id
+            if queued and kind == "failed":
+                return False
+            if queued:
+                if self.history.confirm_queued(msg_id, peer_id, kind):
+                    del self._outbox[msg_id]
+            else:
+                self.history.add_receipt(msg_id, peer_id, kind)
+        return True
 
     def _on_read(self, peer_id: str, msg_ids: list) -> None:
         for msg_id in msg_ids:
-            self.history.add_receipt(msg_id, peer_id, "read")
+            self._record_receipt(msg_id, peer_id, "read")
         self._emit(EventType.MESSAGE_READ, (peer_id, list(msg_ids)))
 
     def _on_reaction(self, msg_id: str, peer_id: str, code: str) -> None:

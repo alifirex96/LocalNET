@@ -42,6 +42,7 @@ class Peer:
     online: bool = True
     ident: str = ""          # отпечаток «пользователь@компьютер»
     ban_version: int = 0     # версия списка блокировок у этого узла
+    avatar: str = ""
 
     @property
     def msg_endpoint(self) -> str:
@@ -63,6 +64,7 @@ class ChatMessage:
     ts: float = field(default_factory=time.time)
     sender_ip: str = ""
     outgoing: bool = False
+    queued: bool = False
 
     @property
     def is_private(self) -> bool:
@@ -116,6 +118,11 @@ class Transfer:
     speed: float = 0.0  # байт/с
     error: str = ""
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
+    group: bool = False
+
+    @property
+    def conversation(self) -> str:
+        return ALL_CHAT if self.group else self.peer_id
 
     @property
     def progress(self) -> float:
@@ -143,6 +150,7 @@ class Transfer:
             speed=self.speed,
             error=self.error,
             cancel_event=self.cancel_event,
+            group=self.group,
         )
 
 
