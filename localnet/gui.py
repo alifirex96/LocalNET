@@ -78,11 +78,11 @@ STICKER_PREFIX = "[Стикер] "
 class C:
     """Палитра."""
 
-    TOP_LEFT = "#23418d"
-    TOP_RIGHT = "#1c62a1"
-    BG = "#23418d"
-    RAIL = "#23418d"
-    RAIL_ACTIVE = "#365ba9"
+    TOP_LEFT = "#2563d9"
+    TOP_RIGHT = "#34b0f0"
+    BG = "#2a6fdc"
+    RAIL = "#2a6fdc"
+    RAIL_ACTIVE = "#4f8ff0"
     PANEL = "#ffffff"
     LINE = "#edf0f4"
     SEARCH_BG = "#f1f4f8"
@@ -92,7 +92,7 @@ class C:
     ACCENT = "#235f9d"
     ACCENT_DARK = "#194d83"
     LINK = "#235f9d"
-    CHAT_BG = "#e8eff7"
+    CHAT_BG = "#d3e7f6"
     BUBBLE_IN = "#ffffff"
     BUBBLE_OUT = "#dfeafc"
     PILL = "#506780"
@@ -119,6 +119,61 @@ AVATAR_COLORS = ["#55b6e8", "#7bbf3a", "#f0954a", "#9b6bdb", "#e2615f", "#2bb3a3
 WEEKDAYS = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
 MONTHS_GEN = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября",
               "октября", "ноября", "декабря"]
+
+# Плитка фона переписки (320×320 PNG): светлые контурные иконки на голубом.
+CHAT_TILE_PNG_B64 = (
+    "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"
+    "eFDtAAAAAElFTkSuQmCC"
+)
+TILE_SIZE = 320
 
 # Иконка окна (48×48 PNG): три соединённых узла сети.
 ICON_PNG_B64 = (
@@ -387,6 +442,11 @@ class LocalNetGui:
         self._row_keys: list[tuple[float, float, str]] = []
         self.dnd_enabled = False
         self._hover_shown: Optional[str] = None
+
+        try:
+            self._tile: Optional[tk.PhotoImage] = tk.PhotoImage(data=CHAT_TILE_PNG_B64)
+        except tk.TclError:
+            self._tile = None
 
         self._cards: dict[str, dict] = {}        # tid -> элементы карточки на холсте
         self._card_state: dict[str, TransferState] = {}
@@ -1457,6 +1517,12 @@ class LocalNetGui:
         else:
             y = self._draw_seen(items, y, w)
         total_h = max(y + 10, cv.winfo_height())
+        # узор фона — плиткой под всем содержимым
+        if self._tile is not None:
+            for ty in range(0, int(total_h) + 1, TILE_SIZE):
+                for tx in range(0, int(w) + 1, TILE_SIZE):
+                    cv.create_image(tx, ty, image=self._tile, anchor="nw", tags=("bgtile",))
+            cv.tag_lower("bgtile")
         cv.configure(scrollregion=(0, 0, w, total_h))
         if stick:
             cv.yview_moveto(1.0)
