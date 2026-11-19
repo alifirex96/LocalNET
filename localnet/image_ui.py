@@ -65,9 +65,16 @@ class ImageComposer:
         self.send = ttk.Button(row, text="Отправить", command=self._send)
         self.send.pack(side="right")
         self.window.bind("<Control-Return>", lambda _e: self._send())
-        self.window.grab_set()
+        self.window.bind("<Map>", self._grab, add="+")
         self.caption.focus_set()
         self._render()
+
+    def _grab(self, event):
+        try:
+            if event.widget is self.window and self.window.winfo_viewable():
+                self.window.grab_set()
+        except tk.TclError:
+            pass
 
     def _change_page(self, amount):
         self.page += amount
@@ -245,9 +252,26 @@ class ImageViewer:
             self.canvas.yview_moveto((h - self.canvas.winfo_height()) / (2 * h))
         else:
             self.canvas.itemconfigure("photo", image=self.canvas.photo)
-        if len(preview.frames) > 1:
-            self.frame_after = self.window.after(
-                preview.frames[index][1], self._draw_frame, preview, serial, (index + 1) % len(preview.frames), stride)
+        delay = preview.frames[index][1]
+        if index + 1 < len(preview.frames):
+            self.frame_after = self.window.after(delay, self._draw_frame, preview, serial, index + 1, stride)
+        elif preview.next_frame or preview.first_frame:
+            self.frame_after = self.window.after(delay, self._next_frames, preview, serial, stride)
+        elif len(preview.frames) > 1:
+            self.frame_after = self.window.after(delay, self._draw_frame, preview, serial, 0, stride)
+
+    def _next_frames(self, previous, serial, stride):
+        self.frame_after = None
+        if serial != self.serial:
+            return
+
+        def ready(preview):
+            if preview and preview.frames and self.window.winfo_exists() and serial == self.serial:
+                self._draw_frame(preview, serial, 0, stride)
+
+        self.gui.image_panel.previews.request(
+            self.images[self.index].path, ready, edge=previous.edge, animate=True,
+            start_frame=previous.next_frame)
 
     def _cancel_animation(self):
         if self.frame_after is not None:

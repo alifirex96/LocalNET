@@ -27,6 +27,8 @@ class Preview:
     frames: tuple[tuple[bytes, int], ...]
     format: str = "png"
     edge: int = THUMB_EDGE
+    first_frame: int = 0
+    next_frame: int = 0
 
     def photo(self, root: tk.Misc, index: int = 0) -> tk.PhotoImage:
         data = base64.b64encode(self.frames[index][0]).decode("ascii")
@@ -35,7 +37,8 @@ class Preview:
         return photo.subsample(stride) if stride > 1 else photo
 
 
-def decode_preview(path: Path, edge: int, animate: bool = False, disk_cache: Path | None = None) -> Preview:
+def decode_preview(path: Path, edge: int, animate: bool = False, disk_cache: Path | None = None,
+                   start_frame: int = 0) -> Preview:
     if disk_cache is not None and disk_cache.is_file() and disk_cache.stat().st_size <= MAX_NATIVE_BYTES:
         return Preview(((disk_cache.read_bytes(), 0),), edge=edge)
     modules = pil_modules()
@@ -71,13 +74,17 @@ def decode_preview(path: Path, edge: int, animate: bool = False, disk_cache: Pat
         if not 0 < raster.width * raster.height <= MAX_DECODE_PIXELS:
             raise ValueError("Изображение слишком велико для просмотра")
         frames = []
-        frames_limit = 1
+        stop_frame = 1
+        next_frame = 0
         if animate and getattr(raster, "is_animated", False):
             edge = min(640, edge)
-            frames_limit = min(raster.n_frames, 40, max(2, 14_000_000 // (edge * edge)))
-        for index in range(frames_limit):
+            count = raster.n_frames
+            batch = min(24, max(2, 4_000_000 // (edge * edge)))
+            stop_frame = min(count, start_frame + batch)
+            next_frame = stop_frame if stop_frame < count else 0
+        for index in range(start_frame, stop_frame):
             raster.seek(index)
-            delay = min(2000, max(40, raster.info.get("duration", 100)))
+            delay = min(2000, max(40, raster.info.get("duration") or 100))
             thumbnail = ops.exif_transpose(raster)
             thumbnail.thumbnail((edge, edge), image.Resampling.LANCZOS)
             buffer = io.BytesIO()
@@ -89,7 +96,7 @@ def decode_preview(path: Path, edge: int, animate: bool = False, disk_cache: Pat
             temporary = Path(folder) / "preview.png"
             temporary.write_bytes(frames[0][0])
             os.replace(temporary, disk_cache)
-    return Preview(tuple(frames), edge=edge)
+    return Preview(tuple(frames), edge=edge, first_frame=start_frame, next_frame=next_frame)
 
 
 class ImagePreviews:
@@ -103,14 +110,14 @@ class ImagePreviews:
         self._poll_id = None
 
     def request(self, filename: str, callback, *, edge: int = THUMB_EDGE, animate: bool = False,
-                digest: str = "") -> None:
+                digest: str = "", start_frame: int = 0) -> None:
         path = Path(filename)
         try:
             stat = path.stat()
         except OSError:
             callback(None)
             return
-        key = (path, stat.st_mtime_ns, stat.st_size, edge, animate)
+        key = (path, stat.st_mtime_ns, stat.st_size, edge, animate, start_frame)
         if key in self._cache:
             self._cache.move_to_end(key)
             callback(self._cache[key])
@@ -127,7 +134,7 @@ class ImagePreviews:
 
         def produce() -> None:
             try:
-                preview = decode_preview(path, edge, animate, cache)
+                preview = decode_preview(path, edge, animate, cache, start_frame)
             except (OSError, ValueError, SyntaxError, EOFError):
                 preview = None
             except Exception:  # повреждённый кадр или недоступный декодер

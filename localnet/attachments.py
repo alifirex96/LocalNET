@@ -111,10 +111,13 @@ def verify_image(path: Path, name: str) -> str:
         image, _ = modules
         try:
             with DECODERS, image.open(path, formats=[expected]) as raster:
-                _limit_decode(raster)
+                pixels = raster.width * raster.height
+                if pixels <= 0:
+                    raise ValueError("Некорректные размеры изображения")
                 raster.verify()
-            with DECODERS, image.open(path, formats=[expected]) as raster:
-                raster.load()
+            if pixels <= MAX_DECODE_PIXELS:
+                with DECODERS, image.open(path, formats=[expected]) as raster:
+                    raster.load()
         except (OSError, SyntaxError, image.DecompressionBombError) as exc:
             raise ValueError("Не удалось декодировать изображение") from exc
     return expected

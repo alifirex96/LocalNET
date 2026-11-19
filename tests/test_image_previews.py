@@ -31,3 +31,19 @@ def test_animated_gif_preview_retains_frames_and_timing(tmp_path):
     assert len(static.frames) == 1
     assert [delay for _, delay in motion.frames] == [90, 180, 270]
     assert len({data for data, _ in motion.frames}) == 3
+
+
+def test_long_animation_decodes_in_bounded_batches(tmp_path):
+    pytest.importorskip("tkinter")
+    image = pytest.importorskip("PIL.Image")
+    from localnet.image_previews import decode_preview
+
+    path = tmp_path / "long.gif"
+    frames = [image.new("RGB", (22, 16), (i * 3, i * 2, i)) for i in range(50)]
+    frames[0].save(path, save_all=True, append_images=frames[1:], loop=0, duration=100)
+    batch = decode_preview(path, 32, animate=True)
+    assert len(batch.frames) == batch.next_frame == 24
+    second = decode_preview(path, 32, animate=True, start_frame=batch.next_frame)
+    assert second.first_frame == 24 and second.next_frame == 48
+    last = decode_preview(path, 32, animate=True, start_frame=second.next_frame)
+    assert len(last.frames) == 2 and last.next_frame == 0

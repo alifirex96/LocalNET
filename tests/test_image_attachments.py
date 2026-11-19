@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from localnet import file_transfer as ft
+from localnet import attachments, file_transfer as ft
 from localnet.app import LocalNetCore
 from localnet.attachments import ImageAttachment, ImageStore, verify_image
 from localnet.config import Config
@@ -150,6 +150,17 @@ def test_photo_mode_preserves_alpha_proportions_and_source(tmp_path):
     with image.open(payload) as photo:
         assert photo.size == (2048, 1024)
         assert photo.getpixel((0, 0))[3] == 127
+
+
+def test_original_file_can_exceed_the_preview_pixel_budget(tmp_path, monkeypatch):
+    pytest.importorskip("PIL.Image")
+    monkeypatch.setattr(attachments, "MAX_DECODE_PIXELS", 100)
+    path = _png(tmp_path / "original.png", width=32, height=24)
+    store = ImageStore(tmp_path / "store")
+    payload, name, _ = store.prepare(path, path.name, "file", threading.Event())
+    assert name == path.name and sha256_file(payload) == sha256_file(path)
+    with pytest.raises(ValueError, match="слишком велико"):
+        store.prepare(path, path.name, "photo", threading.Event())
 
 
 @pytest.mark.parametrize("suffix,container", [
