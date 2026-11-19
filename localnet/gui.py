@@ -13,8 +13,10 @@ from __future__ import annotations
 import logging
 import os
 import queue
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
@@ -29,8 +31,13 @@ from typing import Callable, Optional
 
 from . import APP_NAME, __version__
 from . import updater
+from .aa import AA
 from .app import LocalNetCore
+from .attachments import FORMATS, MAX_ALBUM
 from .history import StoredMessage
+from .image_clipboard import MIME, read_image
+from .image_ui import ImageComposer, ImagePanel, ImageViewer, album_key
+from .messaging import MAX_TEXT
 from .media import IMAGE_SUFFIXES, avatar_photo, encode_avatar, image_preview, table_from_html, table_rows
 from .models import (
     ALL_CHAT,
@@ -77,11 +84,11 @@ STICKER_PREFIX = "[Стикер] "
 class C:
     """Палитра."""
 
-    TOP_LEFT = "#23418d"
-    TOP_RIGHT = "#1c62a1"
-    BG = "#23418d"
-    RAIL = "#23418d"
-    RAIL_ACTIVE = "#365ba9"
+    TOP_LEFT = "#2563d9"
+    TOP_RIGHT = "#7750c8"
+    BG = "#2a6fdc"
+    RAIL = "#2a6fdc"
+    RAIL_ACTIVE = "#4f8ff0"
     PANEL = "#ffffff"
     LINE = "#edf0f4"
     SEARCH_BG = "#f1f4f8"
@@ -91,7 +98,7 @@ class C:
     ACCENT = "#235f9d"
     ACCENT_DARK = "#194d83"
     LINK = "#235f9d"
-    CHAT_BG = "#e8eff7"
+    CHAT_BG = "#d3e7f6"
     BUBBLE_IN = "#ffffff"
     BUBBLE_OUT = "#dfeafc"
     PILL = "#506780"
@@ -118,6 +125,61 @@ AVATAR_COLORS = ["#55b6e8", "#7bbf3a", "#f0954a", "#9b6bdb", "#e2615f", "#2bb3a3
 WEEKDAYS = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
 MONTHS_GEN = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября",
               "октября", "ноября", "декабря"]
+
+# Плитка фона переписки (320×320 PNG): светлые контурные иконки на голубом.
+CHAT_TILE_PNG_B64 = (
+    "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"
+    "eFDtAAAAAElFTkSuQmCC"
+)
+TILE_SIZE = 320
 
 # Иконка окна (48×48 PNG): три соединённых узла сети.
 ICON_PNG_B64 = (
@@ -214,7 +276,15 @@ def short_time(ts: float) -> str:
     return f"{d.day} {MONTHS_GEN[d.month - 1][:3]}"
 
 
+_AA: Optional[AA] = None  # сглаживание включается при создании окна
+
+
 def rounded_rect(cv: tk.Canvas, x1: float, y1: float, x2: float, y2: float, r: float, **kw) -> int:
+    """Скруглённый прямоугольник: сглаженный (если доступно) или многоугольник Tk (пунктир)."""
+    if _AA is not None and "dash" not in kw:
+        ids = _AA.draw_rect(cv, x1, y1, x2, y2, r, kw.get("fill", ""), kw.get("outline") or None,
+                            kw.get("width", 1), tags=kw.get("tags", ()), state=kw.get("state", tk.NORMAL))
+        return ids[0]
     r = max(0.0, min(r, (x2 - x1) / 2, (y2 - y1) / 2))
     pts = [x1 + r, y1, x1 + r, y1, x2 - r, y1, x2 - r, y1, x2, y1,
            x2, y1 + r, x2, y1 + r, x2, y2 - r, x2, y2 - r, x2, y2,
@@ -222,6 +292,19 @@ def rounded_rect(cv: tk.Canvas, x1: float, y1: float, x2: float, y2: float, r: f
            x1, y2 - r, x1, y2 - r, x1, y1 + r, x1, y1 + r, x1, y1]
     kw.setdefault("outline", "")
     return cv.create_polygon(pts, smooth=True, splinesteps=18, **kw)
+
+
+def oval(cv: tk.Canvas, x1: float, y1: float, x2: float, y2: float, fill: str = "", outline: str = "",
+         width: float = 1, tags=(), state: str = tk.NORMAL) -> int:
+    """Круг со сглаженными краями (картинка) — или обычный овал Tk, если это не круг."""
+    if _AA is not None and abs((x2 - x1) - (y2 - y1)) < 0.6:
+        d = max(2, int(round(x2 - x1)))
+        if not fill and outline:
+            img = _AA.ring(d, outline, width)
+        else:
+            img = _AA.circle(d, fill, outline if outline and outline != fill else None, width if outline else 0)
+        return cv.create_image(int(round(x1)), int(round(y1)), anchor="nw", image=img, tags=tags, state=state)
+    return oval(cv, x1, y1, x2, y2, fill=fill, outline=outline, width=width, tags=tags, state=state)
 
 
 def fit(text: str, fnt: tkfont.Font, width: int) -> str:
@@ -327,6 +410,8 @@ class LocalNetGui:
         except tk.TclError:
             pass
         self.f = Fonts(self.root)
+        global _AA
+        self.aa = _AA = AA(self.root)
         _detect_non_bmp(self.root)
 
         self.current = ALL_CHAT
@@ -353,10 +438,21 @@ class LocalNetGui:
         self.list_visible = True
         self._hover_hide: Optional[str] = None
         self._drop_key: Optional[str] = None
+        self._text_items: dict[str, int] = {}     # msg_id -> текстовый элемент холста
+        self._text_owner: dict[int, str] = {}     # элемент -> msg_id
+        self._sel_anchor: Optional[tuple[int, int]] = None
+        self._selecting = False
+        self._redraw_after_select = False
+        self._ban_shown: Optional[str] = None
         self._overlay_key: Optional[str] = "-"
         self._row_keys: list[tuple[float, float, str]] = []
         self.dnd_enabled = False
         self._hover_shown: Optional[str] = None
+
+        try:
+            self._tile: Optional[tk.PhotoImage] = tk.PhotoImage(data=CHAT_TILE_PNG_B64)
+        except tk.TclError:
+            self._tile = None
 
         self._cards: dict[str, dict] = {}        # tid -> элементы карточки на холсте
         self._card_state: dict[str, TransferState] = {}
@@ -374,6 +470,9 @@ class LocalNetGui:
         self._update_installed = False
         self._closing = False
         self._update_results = queue.Queue()
+        self._clipboard_images = queue.Queue()
+        self._clipboard_image_pending = False
+        self.image_panel = ImagePanel(self, C, rounded_rect, tk_safe)
 
         self._build()
         self._setup_dnd()
@@ -432,8 +531,11 @@ class LocalNetGui:
         self.chat_frame = tk.Frame(right, bg=C.CHAT_BG)
         self.chat_frame.pack(fill=tk.BOTH, expand=True)
         self.chat = tk.Canvas(self.chat_frame, highlightthickness=0, bd=0, bg=C.CHAT_BG)
+        self.chat.configure(yscrollcommand=lambda *_args: self.image_panel.schedule_visible())
         self.chat.pack(fill=tk.BOTH, expand=True)
         self.chat.bind("<Configure>", lambda _e: self._schedule_chat())
+        self.chat.configure(selectbackground="#b3d7f7", selectforeground=C.TEXT)
+        self._setup_selection()
 
         self.input = tk.Canvas(right, height=88, highlightthickness=0, bd=0, bg=C.CHAT_BG)
         self.input.pack(fill=tk.X)
@@ -607,13 +709,7 @@ class LocalNetGui:
         cv.create_rectangle(10, h / 2 - 14, 40, h / 2 + 14, fill="", outline="", tags=("burger",))
         self._clickable(cv, "burger", self.toggle_list)
         # логотип: три соединённых узла
-        x, y = 68, h / 2
-        pts = [(x - 10, y + 7), (x + 10, y + 7), (x, y - 10)]
-        for p in pts:
-            for q in pts:
-                cv.create_line(*p, *q, fill="#ffffff", width=2)
-        for px, py in pts:
-            cv.create_oval(px - 5, py - 5, px + 5, py + 5, fill="#ffffff", outline="")
+        self.aa.draw_icon(cv, 68, h / 2, "logo", 30, "#ffffff", 2.2)
         cv.create_text(90, h / 2, text=APP_NAME, font=f.brand, fill="#ffffff", anchor="w")
 
         # справа: кнопки-«пилюли» и свой аватар
@@ -649,8 +745,8 @@ class LocalNetGui:
     def _draw_avatar(self, canvas, x, y, radius, name, node_id, *, tags=(), color=None) -> None:
         peer = self.core.registry.get(node_id)
         avatar = self.core.config.avatar if node_id == self.core.node_id else (peer.avatar if peer else "")
-        canvas.create_oval(x - radius, y - radius, x + radius, y + radius,
-                           fill=color or avatar_color(name), outline="#ffffff", width=1, tags=tags)
+        oval(canvas, x - radius, y - radius, x + radius, y + radius,
+             fill=color or avatar_color(name), outline="#ffffff", width=1, tags=tags)
         photo = self._avatar_photo(avatar, max(1, (2 * radius - 2) // 16))
         if photo is not None:
             canvas.avatar_refs[(avatar, radius)] = photo
@@ -685,24 +781,13 @@ class LocalNetGui:
         self._clickable(cv, "rail_settings", self.open_settings)
 
     def _icon_chats(self, cv: tk.Canvas, x: float, y: float, tag: str) -> None:
-        rounded_rect(cv, x - 13, y - 11, x + 11, y + 7, 6, fill="", outline="#ffffff", width=2, tags=(tag,))
-        cv.create_line(x - 7, y + 6, x - 10, y + 13, x - 1, y + 7, fill="#ffffff", width=2, tags=(tag,))
-        cv.create_line(x + 5, y - 6, x + 15, y - 6, x + 15, y + 10, fill="#ffffff", width=2, tags=(tag,))
+        self.aa.draw_icon(cv, x, y, "chats", 30, "#ffffff", 2.0, tags=(tag,))
 
-    def _icon_files(self, cv: tk.Canvas, x: float, y: float, tag: str) -> None:
-        cv.create_line(x - 10, y - 13, x + 4, y - 13, x + 11, y - 6, x + 11, y + 13, x - 10, y + 13, x - 10, y - 13,
-                       fill="#ffffff", width=2, joinstyle=tk.ROUND, tags=(tag,))
-        cv.create_line(x, y - 5, x, y + 7, fill="#ffffff", width=2, tags=(tag,))
-        cv.create_line(x - 5, y + 2, x, y + 7, x + 5, y + 2, fill="#ffffff", width=2, tags=(tag,))
+    def _icon_files(self, cv: tk.Canvas, x: float, y: float, tag: str, color: str = "#ffffff") -> None:
+        self.aa.draw_icon(cv, x, y, "files", 30, color, 2.0, tags=(tag,))
 
     def _icon_gear(self, cv: tk.Canvas, x: float, y: float, tag: str) -> None:
-        import math
-        for i in range(8):
-            a = i * math.pi / 4
-            cv.create_line(x + 9 * math.cos(a), y + 9 * math.sin(a), x + 14 * math.cos(a), y + 14 * math.sin(a),
-                           fill="#ffffff", width=4, capstyle=tk.ROUND, tags=(tag,))
-        cv.create_oval(x - 10, y - 10, x + 10, y + 10, outline="#ffffff", width=3, fill=C.RAIL, tags=(tag,))
-        cv.create_oval(x - 4, y - 4, x + 4, y + 4, outline="#ffffff", width=2, tags=(tag,))
+        self.aa.draw_icon(cv, x, y, "gear", 32, "#ffffff", 2.2, tags=(tag,))
 
     def _badge(self, cv: tk.Canvas, x: float, y: float, n: int, color: str) -> None:
         text = str(n) if n < 100 else "99+"
@@ -715,8 +800,7 @@ class LocalNetGui:
     def _draw_search(self, cv: tk.Canvas, width: int) -> None:
         cv.delete("bg")
         rounded_rect(cv, 14, 12, width - 14, 52, 20, fill=C.SEARCH_BG, tags=("bg",))
-        cv.create_oval(30, 25, 42, 37, outline=C.MUTED, width=2, tags=("bg",))
-        cv.create_line(40, 35, 46, 41, fill=C.MUTED, width=2, capstyle=tk.ROUND, tags=("bg",))
+        self.aa.draw_icon(cv, 38, 32, "search", 22, C.MUTED, 2.0, tags=("bg",))
         cv.delete("win")
         cv.create_window(56, 32, window=self.search_entry, anchor="w", width=max(40, width - 84), tags=("win",))
 
@@ -752,7 +836,8 @@ class LocalNetGui:
         for nid in self.contacts:
             if nid not in known and nid != self.core.node_id:
                 known[nid] = self._peer(nid)  # type: ignore[assignment]
-        peers = list(known.values())
+        # Заблокированные администратором в списке не показываются.
+        peers = [p for p in known.values() if not self.core.is_banned(p.node_id, p.ident)]
         peers.sort(key=lambda p: (not p.online, -self.preview.get(p.node_id, (0, ""))[0], p.nickname.lower()))
         rows: list[tuple[str, str, Optional[Peer]]] = [(ALL_CHAT, "Общий чат", None)]
         rows += [(p.node_id, p.nickname, p) for p in peers]
@@ -785,13 +870,13 @@ class LocalNetGui:
             # аватар
             cx, cy, r = 42, y + row_h / 2, 25
             if key == ALL_CHAT:
-                cv.create_oval(cx - r, cy - r, cx + r, cy + r, fill="#2fa8e6", outline="", tags=(tag,))
+                oval(cv, cx - r, cy - r, cx + r, cy + r, fill="#2fa8e6", outline="", tags=(tag,))
                 cv.create_text(cx, cy, text="#", font=f.icon, fill="#ffffff", tags=(tag,))
             else:
                 color = avatar_color(name) if (peer is None or peer.online) else "#b7c0c8"
                 self._draw_avatar(cv, cx, cy, r, name, key, tags=(tag,), color=color)
                 if peer is not None and peer.online:
-                    cv.create_oval(cx + 11, cy + 11, cx + 25, cy + 25, fill=C.ONLINE, outline=bg, width=3,
+                    oval(cv, cx + 11, cy + 11, cx + 25, cy + 25, fill=C.ONLINE, outline=bg, width=3,
                                    tags=(tag,))
             # время и непрочитанные
             ts, prev = self.preview.get(key, (0.0, ""))
@@ -825,6 +910,7 @@ class LocalNetGui:
                              dash=(6, 4), tags=(tag,))
             self._row_keys.append((y, y + row_h, key))
             self._clickable(cv, tag, lambda k=key: self.select(k), cursor="")
+            cv.tag_bind(tag, "<Button-3>", lambda e, k=key: self._dialog_menu(e, k))
             y += row_h
         if len(rows) == 1 and not self.search_query:
             cv.create_text(w / 2, y + 40, text="Ищем других участников в сети…\nОни появятся здесь автоматически.",
@@ -841,13 +927,13 @@ class LocalNetGui:
         cy, r = 36, 25
         key = self.current
         if key == FILES_VIEW:
-            cv.create_oval(24, cy - r, 24 + 2 * r, cy + r, fill="#f0954a", outline="")
+            oval(cv, 24, cy - r, 24 + 2 * r, cy + r, fill="#f0954a", outline="")
             self._icon_files(cv, 24 + r, cy, "hdr")
             title = "Передачи файлов"
             active = sum(1 for t in self.transfers.values() if not t.state.finished)
             sub = f"всего {len(self.transfers)}" + (f", активных {active}" if active else "")
         elif key == ALL_CHAT:
-            cv.create_oval(24, cy - r, 24 + 2 * r, cy + r, fill="#2fa8e6", outline="")
+            oval(cv, 24, cy - r, 24 + 2 * r, cy + r, fill="#2fa8e6", outline="")
             cv.create_text(24 + r, cy, text="#", font=f.icon, fill="#ffffff")
             title = "Общий чат"
             online = len(self.core.registry.online())
@@ -859,15 +945,24 @@ class LocalNetGui:
             title = name
             if peer is None:
                 sub = ""
+            elif self.core.is_banned(key, peer.ident):
+                sub = "заблокирован(а) администратором"
             elif peer.online:
                 sub = f"в сети · {peer.ip}"
             else:
                 sub = f"не в сети, был(а) в {_hm(peer.last_seen)} · {peer.ip}"
         right_limit = w - 20
         if key != FILES_VIEW:
+            # «⋮» — меню диалога (удалить / очистить)
+            self.aa.draw_icon(cv, w - 34, cy, "dots", 26, C.MUTED, tags=("kebab",))
+            cv.create_rectangle(w - 52, cy - 18, w - 16, cy + 18, fill="", outline="", tags=("kebab",))
+            cv.tag_bind("kebab", "<Button-1>", lambda e, k=key: self._dialog_menu(e, k))
+            cv.tag_bind("kebab", "<Enter>", lambda _e: cv.configure(cursor="hand2"))
+            cv.tag_bind("kebab", "<Leave>", lambda _e: cv.configure(cursor=""))
+            right_limit = w - 60
             label = "Отправить файл"
             bw = f.top_bold.measure(label) + 52
-            x2 = w - 20
+            x2 = w - 60
             rounded_rect(cv, x2 - bw, cy - 17, x2, cy + 17, 17, fill=C.ACCENT, tags=("sendfile",))
             self._icon_plus(cv, x2 - bw + 20, cy, "sendfile", color="#ffffff", bg=C.ACCENT, small=True)
             cv.create_text(x2 - bw + 34, cy, text=label, font=f.top_bold, fill="#ffffff", anchor="w",
@@ -878,8 +973,7 @@ class LocalNetGui:
             x = right_limit - 18
             tags = ("history_search",)
             rounded_rect(cv, x - 17, cy - 17, x + 17, cy + 17, 10, fill=C.SEARCH_BG, tags=tags)
-            cv.create_oval(x - 7, cy - 7, x + 3, cy + 3, outline=C.ACCENT, width=2, tags=tags)
-            cv.create_line(x + 2, cy + 2, x + 8, cy + 8, fill=C.ACCENT, width=2, tags=tags)
+            self.aa.draw_icon(cv, x, cy, "search", 20, C.ACCENT, 2.0, tags=tags)
             self._clickable(cv, "history_search", self._open_history_search)
             right_limit -= 45
         cv.create_text(90, cy - 11, text=fit(tk_safe(title), f.title, right_limit - 90), font=f.title,
@@ -894,6 +988,15 @@ class LocalNetGui:
         cv.delete("all")
         w = max(cv.winfo_width(), 300)
         x1, x2, y1, y2 = 18, w - 84, 12, 74
+        ban = self.core.my_ban()
+        self._ban_shown = ban.describe() + ban.reason if ban else None
+        if ban is not None:
+            rounded_rect(cv, x1, y1, w - 18, y2, 14, fill="#fdecea")
+            self.aa.draw_icon(cv, x1 + 24, (y1 + y2) / 2, "lock", 22, C.ERROR)
+            text = f"Вы заблокированы администратором {ban.describe()}" + (f". Причина: {ban.reason}" if ban.reason else "")
+            cv.create_text(x1 + 46, (y1 + y2) / 2, text=fit(tk_safe(text), self.f.preview, w - 100), anchor="w",
+                           font=self.f.preview, fill="#9b2c25")
+            return
         rounded_rect(cv, x1, y1, x2, y2, 14, fill="#ffffff")
         self._icon_clip(cv, x1 + 24, (y1 + y2) / 2, "attach", color=C.MUTED)
         cv.create_rectangle(x1 + 8, y1 + 6, x1 + 40, y2 - 6, fill="", outline="", tags=("attach",))
@@ -906,45 +1009,16 @@ class LocalNetGui:
         self._clickable(cv, "emotes", self._open_emotes)
         # круглая кнопка отправки с «бумажным самолётиком»
         cx, cy, r = w - 46, (y1 + y2) / 2, 26
-        cv.create_oval(cx - r, cy - r, cx + r, cy + r, fill=C.ACCENT, outline="", tags=("send",))
-        cv.create_polygon(cx - 10, cy - 11, cx + 13, cy, cx - 10, cy + 11, cx - 6, cy, fill="#ffffff",
-                          outline="", tags=("send",))
+        oval(cv, cx - r, cy - r, cx + r, cy + r, fill=C.ACCENT, outline="", tags=("send",))
+        self.aa.draw_icon(cv, cx + 2, cy, "send", 26, "#ffffff", tags=("send",))
         self._clickable(cv, "send", self.send_message)
 
     def _icon_clip(self, cv: tk.Canvas, x: float, y: float, tag: str, color: str) -> None:
-        """Скрепка, повёрнутая на 45°."""
-        import math
-        pts: list[tuple[float, float]] = []
-
-        def line(x1, y1, x2, y2):
-            pts.extend([(x1, y1), (x2, y2)])
-
-        def arc(cx, cy, r, a1, a2):
-            for i in range(9):
-                a = math.radians(a1 + (a2 - a1) * i / 8)
-                pts.append((cx + r * math.cos(a), cy + r * math.sin(a)))
-
-        line(2, -4, 2, 6)
-        arc(0, 6, 2, 0, 180)
-        line(-2, 6, -2, -8)
-        arc(1, -8, 3, 180, 360)
-        line(4, -8, 4, 7)
-        arc(0, 7, 4, 0, 180)
-        line(-4, 7, -4, -3)
-        ang = math.radians(45)
-        flat = []
-        for px, py in pts:
-            px, py = px * 1.25, py * 1.25
-            flat += [x + px * math.cos(ang) - py * math.sin(ang), y + px * math.sin(ang) + py * math.cos(ang)]
-        cv.create_line(*flat, fill=color, width=2, capstyle=tk.ROUND, joinstyle=tk.ROUND, tags=(tag,))
+        self.aa.draw_icon(cv, x, y, "clip", 28, color, 2.0, tags=(tag,))
 
     def _icon_plus(self, cv: tk.Canvas, x: float, y: float, tag: str, color: str, bg: str,
                    small: bool = False) -> None:
-        r = 8 if small else 11
-        cv.create_oval(x - r, y - r, x + r, y + r, outline=color, width=2, fill=bg, tags=(tag,))
-        d = r - 4
-        cv.create_line(x - d, y, x + d, y, fill=color, width=2, tags=(tag,))
-        cv.create_line(x, y - d, x, y + d, fill=color, width=2, tags=(tag,))
+        self.aa.draw_icon(cv, x, y, "plus", 18 if small else 24, color, 1.8, tags=(tag,))
 
     # --------------------------------------------------------------- общее
 
@@ -1012,6 +1086,7 @@ class LocalNetGui:
             offer.resolve(False)
         self._closing = True
         try:
+            self.image_panel.previews.close()
             self.core.stop()
             if restart:
                 subprocess.Popen([sys.executable, "-m", "localnet", *sys.argv[1:]])
@@ -1023,6 +1098,9 @@ class LocalNetGui:
     def _periodic(self) -> None:
         self._schedule_list()
         self._draw_header()
+        ban = self.core.my_ban()
+        if (ban.describe() + ban.reason if ban else None) != self._ban_shown:
+            self._draw_input()  # блокировка выдана, снята или истекла
         self.root.after(1000, self._periodic)
 
     # ------------------------------------------------------------------ #
@@ -1161,6 +1239,15 @@ class LocalNetGui:
                 if code and entry.msg.outgoing:
                     self.show_toast(f"{self._name(peer_id)}: {REACTIONS.get(code, '')} "
                                     f"на «{entry.msg.text[:40]}»")
+        elif etype == EventType.MESSAGES_DELETED:
+            self._remove_messages(list(data))
+        elif etype == EventType.PEER_MERGED:
+            self._on_merged(*data)
+        elif etype == EventType.BANS_UPDATED:
+            self.show_toast("Администратор обновил список блокировок")
+            self._draw_input()
+            self._draw_header()
+            self._schedule_list()
         elif etype == EventType.TRANSFER_UPDATED:
             self._on_transfer(data)
         elif etype == EventType.FILE_OFFER:
@@ -1174,6 +1261,30 @@ class LocalNetGui:
     @staticmethod
     def _conv_of(msg: ChatMessage) -> str:
         return ALL_CHAT if msg.to is None else (msg.to if msg.outgoing else msg.sender_id)
+
+    def _on_merged(self, old: str, new: str) -> None:
+        """Дубль собеседника объединён ядром: перезагружаем оба диалога из истории."""
+        for key in (old, new):
+            self._loaded.discard(key)
+            for item in self.items.pop(key, []):
+                if item.entry is not None:
+                    self.entries_by_id.pop(item.entry.msg.msg_id, None)
+            self._item_ids.pop(key, None)
+        self.contacts.pop(old, None)
+        moved = self.unread.pop(old, 0)
+        if moved:
+            self.unread[new] = self.unread.get(new, 0) + moved
+        for t in self.transfers.values():
+            if t.peer_id == old:
+                t.peer_id = new
+        self.preview.pop(old, None)
+        self._refresh_previews({new})
+        if self.current == old:
+            self.current = new
+        if self.current == new:
+            self._ensure_loaded(new)
+            self._schedule_chat()
+            self._draw_header()
 
     def _ensure_loaded(self, key: str) -> None:
         """Подгружает чат из истории при первом обращении."""
@@ -1260,7 +1371,7 @@ class LocalNetGui:
                 self.preview[key] = (prev[0], f"↓ {t.name}")
                 self._schedule_list()
         if t.state.finished and self._card_state.get(t.transfer_id) != t.state:
-            if t.state == TransferState.DONE and t.path and Path(t.name).suffix.lower() in IMAGE_SUFFIXES:
+            if not t.image and t.state == TransferState.DONE and t.path and Path(t.name).suffix.lower() in IMAGE_SUFFIXES:
                 self._show_image_inline(t, quiet=True)
             if t.state == TransferState.DONE and t.direction == TransferDirection.RECEIVE:
                 self.show_toast(f"Получен файл «{t.name}» от {t.peer_nick}")
@@ -1270,6 +1381,14 @@ class LocalNetGui:
         visible = self.current in (FILES_VIEW, key)
         if not visible:
             self._card_state[t.transfer_id] = t.state
+            return
+        if t.image and self.current != FILES_VIEW:
+            previous = self._card_state.get(t.transfer_id)
+            self._card_state[t.transfer_id] = t.state
+            if not first and previous == t.state == TransferState.TRANSFERRING:
+                self.image_panel.update_progress(t)
+            else:
+                self._schedule_chat()
             return
         card = self._cards.get(t.transfer_id)
         if card is not None and self._card_state.get(t.transfer_id) == t.state and not first:
@@ -1283,6 +1402,8 @@ class LocalNetGui:
         t = offer.transfer
         if t.cancel_event.is_set():
             offer.resolve(False)
+            return
+        if t.image and self.image_panel.consume_decision(offer):
             return
         self.offers[t.transfer_id] = offer
         key = t.conversation
@@ -1378,18 +1499,31 @@ class LocalNetGui:
 
     def _render_chat(self, stick: Optional[bool] = None) -> None:
         self._chat_redraw_pending = False
+        if self._selecting:
+            self._redraw_after_select = True  # не перерисовываем, пока пользователь выделяет текст
+            return
         cv = self.chat
         if stick is None:
             stick = cv.yview()[1] >= 0.999
+        saved = self._saved_selection()
+        self.image_panel.start_draw()
         cv.delete("all")
         cv.avatar_refs = {}
         self._cards.clear()
+        self._text_items.clear()
+        self._text_owner.clear()
         w = cv.winfo_width()
         if w < 100:
             w = 700
         y = 16.0
         last_day = None
         items = self._view_items()
+        albums = {}
+        if self.current != FILES_VIEW:
+            for item in items:
+                transfer = self.transfers.get(item.tid) if item.kind == "transfer" else None
+                if transfer is not None and transfer.image:
+                    albums.setdefault(album_key(transfer), []).append(transfer)
         for item in items:
             day = datetime.fromtimestamp(item.ts).date()
             if day != last_day:
@@ -1400,7 +1534,12 @@ class LocalNetGui:
             elif item.kind == "transfer":
                 t = self.transfers.get(item.tid)
                 if t is not None:
-                    y = self._draw_card(t, y, w)
+                    if t.image and self.current != FILES_VIEW:
+                        album = albums.pop(album_key(t), None)
+                        if album is not None:
+                            y = self.image_panel.draw(album, y, w)
+                    else:
+                        y = self._draw_card(t, y, w)
             else:
                 y = self._draw_pill(item.text, y, w, small=True)
         if not items:
@@ -1411,9 +1550,20 @@ class LocalNetGui:
         else:
             y = self._draw_seen(items, y, w)
         total_h = max(y + 10, cv.winfo_height())
+        # узор фона — плиткой под всем содержимым
+        if self._tile is not None:
+            for ty in range(0, int(total_h) + 1, TILE_SIZE):
+                for tx in range(0, int(w) + 1, TILE_SIZE):
+                    cv.create_image(tx, ty, image=self._tile, anchor="nw", tags=("bgtile",))
+            cv.tag_lower("bgtile")
         cv.configure(scrollregion=(0, 0, w, total_h))
         if stick:
             cv.yview_moveto(1.0)
+        self.image_panel.schedule_visible()
+        if saved is not None and saved[0] in self._text_items:
+            item = self._text_items[saved[0]]
+            cv.select_from(item, saved[1])
+            cv.select_to(item, saved[2])
 
     def _draw_seen(self, items: list[_Item], y: float, w: int) -> float:
         """Плашка «Просмотрено: …» под последним своим прочитанным сообщением."""
@@ -1466,8 +1616,10 @@ class LocalNetGui:
             tw, th = self._draw_table(rows, maxw - 2 * pad, tags)
             cv.tag_bind(body, "<Button-1>", lambda _e: self._open_table(rows))
         else:
-            cv.create_text(0, 0, text=tk_safe(m.text), font=f.text, fill=C.TEXT, anchor="nw",
-                           width=maxw - 2 * pad, tags=tags)
+            text_id = cv.create_text(0, 0, text=tk_safe(m.text), font=f.text, fill=C.TEXT, anchor="nw",
+                                     width=maxw - 2 * pad, tags=(*tags, "seltext"))
+            self._text_items[m.msg_id] = text_id
+            self._text_owner[text_id] = m.msg_id
             x1b, y1b, x2b, y2b = cv.bbox(body)
             tw, th = x2b - x1b, y2b - y1b
         name_h = name_w = 0
@@ -1527,7 +1679,7 @@ class LocalNetGui:
         lx = (x1 - 38) if right_side else (x2 + 8)
         like_tag = f"like_{m.msg_id}"
         liked = mine == "like"
-        cv.create_oval(lx, y2 - 30, lx + 30, y2, fill="#ffffff", outline=C.LINE, state=tk.HIDDEN,
+        oval(cv, lx, y2 - 30, lx + 30, y2, fill="#ffffff", outline=C.LINE, state=tk.HIDDEN,
                        tags=(group, like_tag))
         cv.create_text(lx + 15, y2 - 15, text="♥" if liked else "♡", font=f.name,
                        fill=REACTION_COLORS["like"] if liked else C.MUTED, state=tk.HIDDEN, tags=(group, like_tag))
@@ -1601,14 +1753,237 @@ class LocalNetGui:
 
     def _message_menu(self, event, entry: _ChatEntry) -> None:
         menu = tk.Menu(self.root, tearoff=0)
+        selected = self._selected_text(entry.msg.msg_id)
+        if selected:
+            menu.add_command(label="Копировать выделенное", command=lambda: self._to_clipboard(selected))
+        menu.add_command(label="Копировать текст", command=lambda: self._to_clipboard(entry.msg.text))
+        menu.add_separator()
         mine = entry.reactions.get(self.core.node_id)
         for code, glyph in REACTIONS.items():
             mark = "  ✓" if code == mine else ""
             menu.add_command(label=f"{glyph}  {REACTION_TITLES[code]}{mark}",
                              command=lambda c=code: self.react(entry, c))
         menu.add_separator()
-        menu.add_command(label="Копировать текст", command=lambda: (self.root.clipboard_clear(),
-                                                                    self.root.clipboard_append(entry.msg.text)))
+        menu.add_command(label="Удалить у меня", command=lambda: self.delete_message(entry, for_all=False))
+        if entry.msg.outgoing:
+            menu.add_command(label="Удалить у всех", command=lambda: self.delete_message(entry, for_all=True))
+        menu.tk_popup(event.x_root, event.y_root)
+
+    # ------------------------------------------------------- выделение текста
+
+    def _setup_selection(self) -> None:
+        cv = self.chat
+        cv.tag_bind("seltext", "<ButtonPress-1>", self._sel_start)
+        cv.tag_bind("seltext", "<B1-Motion>", self._sel_drag)
+        cv.tag_bind("seltext", "<ButtonRelease-1>", self._sel_end)
+        cv.tag_bind("seltext", "<Double-Button-1>", self._sel_word)
+        cv.tag_bind("seltext", "<Triple-Button-1>", self._sel_all)
+        cv.tag_bind("seltext", "<Enter>", lambda _e: cv.configure(cursor="xterm"))
+        cv.tag_bind("seltext", "<Leave>", lambda _e: None if self._selecting else cv.configure(cursor=""))
+        cv.bind("<ButtonPress-1>", self._chat_click, add="+")
+        cv.bind("<Control-KeyPress>", self._chat_ctrl, add="+")
+
+    def _index_at(self, item: int, event) -> int:
+        return int(self.chat.index(item, f"@{int(self.chat.canvasx(event.x))},{int(self.chat.canvasy(event.y))}"))
+
+    def _sel_start(self, event) -> None:
+        cv = self.chat
+        items = cv.find_withtag("current")
+        if not items:
+            return
+        item = items[0]
+        cv.focus_set()
+        cv.select_clear()
+        self._sel_anchor = (item, self._index_at(item, event))
+        self._selecting = True
+
+    def _sel_drag(self, event) -> None:
+        if self._sel_anchor is None:
+            return
+        item, anchor = self._sel_anchor
+        idx = self._index_at(item, event)
+        if idx == anchor:
+            self.chat.select_clear()
+            return
+        self.chat.select_from(item, anchor)
+        self.chat.select_to(item, idx - 1 if idx > anchor else idx)
+
+    def _sel_end(self, _event=None) -> None:
+        self._selecting = False
+        self.chat.configure(cursor="")
+        if self._redraw_after_select:
+            self._redraw_after_select = False
+            self._schedule_chat()
+
+    def _sel_word(self, event) -> str:
+        items = self.chat.find_withtag("current")
+        if not items:
+            return "break"
+        item = items[0]
+        text = self.chat.itemcget(item, "text")
+        i = min(self._index_at(item, event), max(0, len(text) - 1))
+        a = i
+        while a > 0 and (text[a - 1].isalnum() or text[a - 1] in "_-"):
+            a -= 1
+        b = i
+        while b < len(text) and (text[b].isalnum() or text[b] in "_-"):
+            b += 1
+        if b > a:
+            self.chat.select_from(item, a)
+            self.chat.select_to(item, b - 1)
+        self._selecting = False
+        return "break"
+
+    def _sel_all(self, _event=None) -> str:
+        items = self.chat.find_withtag("current")
+        if items:
+            text = self.chat.itemcget(items[0], "text")
+            if text:
+                self.chat.select_from(items[0], 0)
+                self.chat.select_to(items[0], len(text) - 1)
+        self._selecting = False
+        return "break"
+
+    def _chat_click(self, _event) -> None:
+        current = self.chat.find_withtag("current")
+        if not current or "seltext" not in self.chat.gettags(current[0]):
+            self.chat.select_clear()
+            self.chat.focus_set()
+
+    def _saved_selection(self) -> Optional[tuple[str, int, int]]:
+        cv = self.chat
+        item = cv.select_item()
+        if not item:
+            return None
+        item = int(item)
+        msg_id = self._text_owner.get(item)
+        if msg_id is None:
+            return None
+        try:
+            return msg_id, int(cv.index(item, "sel.first")), int(cv.index(item, "sel.last"))
+        except tk.TclError:
+            return None
+
+    def _selected_text(self, msg_id: Optional[str] = None) -> str:
+        saved = self._saved_selection()
+        if saved is None or (msg_id is not None and saved[0] != msg_id):
+            return ""
+        item = self._text_items.get(saved[0])
+        if item is None:
+            return ""
+        return self.chat.itemcget(item, "text")[saved[1]:saved[2] + 1]
+
+    def _to_clipboard(self, text: str) -> None:
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.show_toast("Скопировано", 1500)
+
+    def _chat_ctrl(self, event):
+        if event.keysym.lower() == "c" or event.keycode in _KEYCODES["copy"]:
+            text = self._selected_text()
+            if text:
+                self._to_clipboard(text)
+            return "break"
+        return None
+
+    # ------------------------------------------------------------ удаление
+
+    def delete_message(self, entry: _ChatEntry, for_all: bool) -> None:
+        question = ("Удалить сообщение у всех участников чата?" if for_all
+                    else "Удалить сообщение? Оно удалится только на этом компьютере.")
+        if not messagebox.askyesno(APP_NAME, question, parent=self.root):
+            return
+        try:
+            self.core.delete_messages([entry.msg.msg_id], for_all=for_all)
+        except Exception:  # noqa: BLE001
+            log.exception("Не удалось удалить сообщение")
+        self._remove_messages([entry.msg.msg_id])
+
+    def _remove_messages(self, ids: list[str]) -> None:
+        gone = set(ids)
+        touched = set()
+        for key, items in self.items.items():
+            kept = [i for i in items if not (i.entry is not None and i.entry.msg.msg_id in gone)]
+            if len(kept) != len(items):
+                self.items[key] = kept
+                touched.add(key)
+                self._item_ids.get(key, set()).difference_update(gone)
+        for msg_id in gone:
+            self.entries_by_id.pop(msg_id, None)
+        if gone.intersection(self._match_ids):
+            self._queue_history_search()
+        self._refresh_previews(touched)
+        if self.current in touched:
+            self._schedule_chat()
+
+    def _refresh_previews(self, keys) -> None:
+        fresh = self.core.history.conversations()
+        for key in keys:
+            if key in fresh:
+                self.preview[key] = fresh[key]
+            else:
+                self.preview.pop(key, None)
+        self._schedule_list()
+
+    def delete_transfer_record(self, t: Transfer) -> None:
+        if not t.state.finished:
+            self.core.cancel_transfer(t.transfer_id)
+        self.core.history.delete_transfer(t.transfer_id)
+        for key, items in self.items.items():
+            self.items[key] = [i for i in items if i.tid != t.transfer_id]
+            self._item_ids.get(key, set()).discard(t.transfer_id)
+        if t.state.finished:
+            self.transfers.pop(t.transfer_id, None)
+        self._inline_images.pop(t.transfer_id, None)
+        self._refresh_previews({t.conversation})
+        self._schedule_chat()
+
+    def delete_dialog(self, key: str) -> None:
+        if key == FILES_VIEW:
+            return
+        if key == ALL_CHAT:
+            question = "Очистить общий чат? Сообщения удалятся только на этом компьютере."
+        else:
+            question = (f"Удалить диалог с «{self._name(key)}»?\n\nПереписка и записи о файлах удалятся "
+                        f"только на этом компьютере. Полученные файлы останутся на диске.")
+        if not messagebox.askyesno(APP_NAME, question, parent=self.root):
+            return
+        self.core.delete_conversation(key)
+        if key == self.current:
+            self._close_history_search(restore_chat=False)
+        for item in self.items.get(key, []):
+            if item.entry is not None:
+                self.entries_by_id.pop(item.entry.msg.msg_id, None)
+            if item.tid and item.tid in self.transfers and self.transfers[item.tid].state.finished:
+                self.transfers.pop(item.tid, None)
+                self._inline_images.pop(item.tid, None)
+        self.items[key] = []
+        self._item_ids[key] = set()
+        self.preview.pop(key, None)
+        self.unread.pop(key, None)
+        peer = self.core.registry.get(key)
+        if key != ALL_CHAT and (peer is None or not peer.online):
+            self.contacts.pop(key, None)
+            if self.current == key:
+                self.select(ALL_CHAT)
+                return
+        self._draw_rail()
+        self._schedule_list()
+        self._schedule_chat()
+        self.show_toast("Диалог удалён" if key != ALL_CHAT else "Общий чат очищен")
+
+    def _dialog_menu(self, event, key: str) -> None:
+        menu = tk.Menu(self.root, tearoff=0)
+        if key != self.current:
+            menu.add_command(label="Открыть", command=lambda: self.select(key))
+        if key not in (ALL_CHAT, FILES_VIEW):
+            peer = self.core.registry.get(key)
+            if peer is not None and peer.online:
+                menu.add_command(label="Отправить файл…", command=lambda: (self.select(key), self.send_file()))
+            menu.add_separator()
+            menu.add_command(label="Удалить диалог…", command=lambda: self.delete_dialog(key))
+        elif key == ALL_CHAT:
+            menu.add_command(label="Очистить общий чат…", command=lambda: self.delete_dialog(key))
         menu.tk_popup(event.x_root, event.y_root)
 
     def react(self, entry: _ChatEntry, code: str) -> None:
@@ -1675,11 +2050,8 @@ class LocalNetGui:
         cx, cy, r = x1 + 36, y + 38, 22
         icon_color = C.OK if t.state == TransferState.DONE else (
             "#b4bec8" if t.state.finished else C.ACCENT)
-        icon = cv.create_oval(cx - r, cy - r, cx + r, cy + r, fill=icon_color, outline="")
-        cv.create_line(cx, cy - 9, cx, cy + 9, fill="#ffffff", width=3, capstyle=tk.ROUND)
-        tip, base = (cy - 9, cy - 2) if out else (cy + 9, cy + 2)
-        cv.create_line(cx - 7, base, cx, tip, cx + 7, base, fill="#ffffff", width=3, capstyle=tk.ROUND,
-                       joinstyle=tk.ROUND)
+        icon = oval(cv, cx - r, cy - r, cx + r, cy + r, fill=icon_color, outline="")
+        self.aa.draw_icon(cv, cx, cy, "up" if out else "down", 26, "#ffffff", 2.6)
         tx = x1 + 70
         inner = x2 - 14 - tx
         cv.create_text(tx, y + 14, text=fit(tk_safe(t.name), f.name, inner - 42), font=f.name, fill=C.TEXT,
@@ -1703,7 +2075,9 @@ class LocalNetGui:
         elif not t.state.finished:
             actions = [("Отменить", lambda: self.core.cancel_transfer(t.transfer_id), False)]
         elif t.state == TransferState.DONE and t.path:
-            if image and preview is None:
+            if t.image:
+                actions.append(("Показать", lambda: ImageViewer(self, [t]), True))
+            elif image and preview is None:
                 actions.append(("Показать", lambda: self._show_image_inline(t), True))
             actions.append(("Открыть папку", lambda: _open_path(os.path.dirname(t.path)), not actions))
         elif out and t.state in (TransferState.FAILED, TransferState.CANCELLED, TransferState.DECLINED):
@@ -1724,6 +2098,10 @@ class LocalNetGui:
             self._draw_avatar(cv, 18 + r2, y2 - r2, r2, nick, node_id)
         self._cards[t.transfer_id] = {"sub": sub, "bar": bar, "x0": tx, "x1": x2 - 16, "y": by, "inner": inner,
                                       "icon": icon}
+        card_tag = f"card_{t.transfer_id}"
+        cv.addtag_overlapping(card_tag, x1, y, x2, y2)
+        cv.dtag("bgtile", card_tag)
+        cv.tag_bind(card_tag, "<Button-3>", lambda e, tr=t: self._card_menu(e, tr))
         self._card_state[t.transfer_id] = t.state
         if preview is not None:
             tag = f"image_{t.transfer_id}"
@@ -1777,6 +2155,15 @@ class LocalNetGui:
         self.chat.coords(card["bar"], card["x0"], card["y"], max(card["x0"] + 0.1, fill_x), card["y"])
         self.chat.itemconfigure(card["bar"], fill=bar_color, state=tk.NORMAL if t.progress > 0 else tk.HIDDEN)
 
+    def _card_menu(self, event, t: Transfer) -> None:
+        menu = tk.Menu(self.root, tearoff=0)
+        if t.state == TransferState.DONE and t.path:
+            menu.add_command(label="Открыть папку", command=lambda: _open_path(os.path.dirname(t.path)))
+        if not t.state.finished:
+            menu.add_command(label="Отменить передачу", command=lambda: self.core.cancel_transfer(t.transfer_id))
+        menu.add_command(label="Удалить из истории", command=lambda: self.delete_transfer_record(t))
+        menu.tk_popup(event.x_root, event.y_root)
+
     def _resolve_offer(self, tid: str, accepted: bool) -> None:
         offer = self.offers.pop(tid, None)
         if offer is not None:
@@ -1789,7 +2176,8 @@ class LocalNetGui:
             self.show_toast(f"{t.peer_nick} сейчас не в сети")
             return
         try:
-            self.core.send_file(t.peer_id, t.path, group=t.group)
+            self.core.send_file(t.peer_id, t.path, group=t.group, image=t.image,
+                                prepared=bool(t.sha256), name=t.name)
         except (OSError, ValueError) as exc:
             self.show_toast(str(exc))
 
@@ -1838,6 +2226,31 @@ class LocalNetGui:
         if paths:
             self.send_paths(self.current, list(paths))
 
+    def _compose_images(self, key: str, paths: list[str]) -> None:
+        if len(paths) > MAX_ALBUM:
+            self.show_toast(f"Можно отправить до {MAX_ALBUM} изображений за раз.")
+            return
+        draft = self.msg_entry.get("1.0", "end-1c") if key == self.current else ""
+
+        def send(selected, mode, caption, separate):
+            if separate and len(draft.strip()) > MAX_TEXT:
+                raise ValueError(f"Текст сообщения длиннее {MAX_TEXT} символов")
+            self.core.send_images(key, selected, mode, caption)
+            if separate and draft.strip():
+                to = None if key == ALL_CHAT else key
+                msg = self.core.send_message(draft, to)
+                targets = len(self.core.registry.online()) if to is None else 1
+                self._add_message(msg, targets=targets)
+            if key == self.current and self.msg_entry.get("1.0", "end-1c") == draft:
+                self.msg_entry.delete("1.0", tk.END)
+                self.msg_entry.edit_reset()
+            self._close_history_search(restore_chat=False)
+            self.select(key)
+
+        dialog = ImageComposer(self.root, self.image_panel.previews, paths, draft, send)
+        recipient = "Общий чат" if key == ALL_CHAT else tk_safe(self._name(key))
+        dialog.window.title(f"Отправить изображения · {recipient}")
+
     def send_paths(self, key: Optional[str], paths: list[str]) -> int:
         """Отправляет файлы в чат ``key`` (пиру или всем в общем чате). Возвращает число запущенных передач."""
         files, dirs = [], []
@@ -1854,6 +2267,12 @@ class LocalNetGui:
         if key is None or key == FILES_VIEW:
             self.show_toast("Выберите получателя: откройте чат или перетащите файл на собеседника в списке")
             return 0
+        images = [path for path in files if Path(path).suffix.lower() in FORMATS]
+        if images:
+            self._compose_images(key, images)
+            files = [path for path in files if Path(path).suffix.lower() not in FORMATS]
+            if not files:
+                return 0
         if key == ALL_CHAT:
             peers = self.core.registry.online()
             if not peers:
@@ -1959,10 +2378,8 @@ class LocalNetGui:
         cv.delete("all")
         rounded_rect(cv, 16, 16, w - 16, h - 16, 22, fill="", outline=C.ACCENT, width=2, dash=(10, 6))
         cx, cy = w / 2, h / 2 - 30
-        cv.create_oval(cx - 34, cy - 34, cx + 34, cy + 34, fill=C.ACCENT, outline="")
-        cv.create_line(cx, cy + 15, cx, cy - 15, fill="#ffffff", width=4, capstyle=tk.ROUND)
-        cv.create_line(cx - 11, cy - 4, cx, cy - 15, cx + 11, cy - 4, fill="#ffffff", width=4, capstyle=tk.ROUND,
-                       joinstyle=tk.ROUND)
+        oval(cv, cx - 34, cy - 34, cx + 34, cy + 34, fill=C.ACCENT, outline="")
+        self.aa.draw_icon(cv, cx, cy, "up", 40, "#ffffff", 3.4)
         if key is None:
             title, sub = "Перетащите файл на собеседника", "в списке чатов слева или откройте личный чат"
         elif key == ALL_CHAT:
@@ -1996,6 +2413,18 @@ class LocalNetGui:
             self.send_paths(self.current, paths)
             return "break"
         try:
+            advertised = self.root.tk.splitlist(self.root.clipboard_get(type="TARGETS"))
+        except tk.TclError:
+            advertised = ()
+        targets = tuple(target for target, _ in MIME if target in advertised)
+        if targets or sys.platform == "win32":
+            self._paste_image(targets)
+            return "break"
+        self._paste_text()
+        return "break"
+
+    def _paste_text(self) -> None:
+        try:
             text = self.root.clipboard_get()
         except tk.TclError:
             text = ""
@@ -2005,8 +2434,102 @@ class LocalNetGui:
             except tk.TclError:
                 pass
         if text:
+            if text.startswith("file://") and os.path.isfile(_path_from_uri(text.strip())):
+                self.send_paths(self.current, [_path_from_uri(text.strip())])
+                return
             self._insert_draft(text.replace("\r\n", "\n").replace("\r", "\n"))
-        return "break"
+
+    def _paste_image(self, targets) -> None:
+        if self._clipboard_image_pending:
+            return
+        self._clipboard_image_pending = True
+        key = self.current
+
+        def read() -> None:
+            try:
+                contents = read_image(targets)
+                if contents is None:
+                    self._clipboard_images.put(None)
+                    return
+                data, suffix = contents
+                self._clipboard_images.put(str(self.core.images.capture(data, suffix)))
+            except Exception:
+                log.debug("Не удалось прочитать изображение из буфера", exc_info=True)
+                self._clipboard_images.put(None)
+
+        def complete() -> None:
+            try:
+                path = self._clipboard_images.get_nowait()
+            except queue.Empty:
+                self.root.after(45, complete)
+                return
+            self._clipboard_image_pending = False
+            if path and key != FILES_VIEW:
+                self._compose_images(key, [path])
+            else:
+                self._paste_text()
+
+        threading.Thread(target=read, name="image-clipboard", daemon=True).start()
+        self.root.after(45, complete)
+
+    def open_attachment(self, path: str) -> None:
+        if Path(path).exists():
+            _open_path(path)
+        else:
+            self.show_toast("Файл больше недоступен.")
+
+    def copy_attachment(self, path: str) -> None:
+        source = Path(path).resolve()
+        if not source.is_file():
+            self.show_toast("Файл больше недоступен.")
+            return
+        xclip = shutil.which("xclip") if self.root.tk.call("tk", "windowingsystem") == "x11" else None
+        suffix = source.suffix.lower().replace(".jpeg", ".jpg")
+        kind = next((mime for mime, ext in MIME if ext == suffix), None)
+        if xclip and kind:
+            try:
+                subprocess.Popen([xclip, "-selection", "clipboard", "-target", kind, "-i", str(source)],
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                self.show_toast("Изображение скопировано.")
+                return
+            except OSError:
+                pass
+        uri = source.as_uri()
+        self.root.clipboard_clear()
+        self.root.clipboard_append(uri)
+        self.root.clipboard_append(uri + "\r\n", type="text/uri-list")
+        self.show_toast("Изображение скопировано как вложение.")
+
+    def save_attachment(self, source: str, target: str) -> None:
+        done = queue.Queue(maxsize=1)
+
+        def save() -> None:
+            try:
+                destination = Path(target)
+                if Path(source).resolve() == destination.resolve():
+                    done.put(None)
+                    return
+                with tempfile.TemporaryDirectory(dir=destination.parent) as folder:
+                    staging = Path(folder) / "image"
+                    shutil.copyfile(source, staging)
+                    os.replace(staging, destination)
+                done.put(None)
+            except OSError as exc:
+                done.put(str(exc))
+
+        def finish() -> None:
+            try:
+                error = done.get_nowait()
+            except queue.Empty:
+                self.root.after(70, finish)
+                return
+            if error:
+                messagebox.showerror("Сохранение изображения", error, parent=self.root)
+            else:
+                self.show_toast("Изображение сохранено.")
+
+        threading.Thread(target=save, name="image-save", daemon=True).start()
+        self.root.after(70, finish)
 
     def _insert_draft(self, text: str) -> str:
         entry = self.msg_entry

@@ -5,6 +5,7 @@ import time
 
 from localnet import app
 from localnet.app import LocalNetCore
+from localnet.bans import Ban, BanList
 from localnet.config import Config
 from localnet.discovery import Presence
 from localnet.models import EventType
@@ -86,5 +87,46 @@ def test_outbox_does_not_write_messages_when_history_disabled(tmp_path):
         assert queued.queued
         assert core.history.pending_messages(core.node_id) == []
         assert core.history.load_messages(queued.to) == []
+    finally:
+        core.history.close()
+
+
+def test_outbox_is_retargeted_when_contacts_merge_and_cleared_on_delete(tmp_path):
+    core = LocalNetCore(_config(tmp_path, "Алиса"))
+    old_id, new_id = "a" * 32, "b" * 32
+    try:
+        core.history.upsert_contact(old_id, "Боб", "127.0.0.1", time.time(), "bob-ident")
+        queued = core.send_message("После переустановки", old_id)
+        peer, _, _ = core.registry.update(
+            Presence("hello", new_id, "Боб", 45893, 45894, "0.4.0", time.time(), ident="bob-ident"),
+            "127.0.0.1")
+        core._on_peer_updated(peer)
+        pending, = core.history.pending_messages(core.node_id)
+        assert pending.msg_id == queued.msg_id and pending.to == new_id
+        assert core._outbox[queued.msg_id][0].to == new_id
+
+        removed = core.send_message("Отменить отправку", new_id)
+        assert core.delete_messages([removed.msg_id]) == [removed.msg_id]
+        assert removed.msg_id not in core._outbox
+        core.delete_conversation(new_id)
+        assert not core._outbox and core.history.pending_messages(core.node_id) == []
+    finally:
+        core.history.close()
+
+
+def test_outbox_respects_a_ban_received_after_queuing(tmp_path, monkeypatch):
+    core = LocalNetCore(_config(tmp_path, "Алиса"))
+    peer_id = "b" * 32
+    try:
+        queued = core.send_message("Ожидает отправки", peer_id)
+        core.registry.update(Presence("hello", peer_id, "Боб", 45893, 45894, "0.4.0", time.time()),
+                             "127.0.0.1")
+        core.banlist = BanList(version=1, bans=[Ban(node_id=peer_id)])
+        attempts = []
+        monkeypatch.setattr(core.messenger, "submit_message", attempts.append)
+        monkeypatch.setattr(core._outbox_stop, "wait", lambda _timeout: core._outbox_stop.set())
+        core._run_outbox()
+        assert not attempts
+        assert core.history.pending_messages(core.node_id) == [queued]
     finally:
         core.history.close()

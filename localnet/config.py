@@ -77,6 +77,9 @@ class Config:
     save_history: bool = True
     # Свои сообщения справа (по умолчанию все сообщения слева).
     own_messages_right: bool = False
+    # Открытый ключ администратора (hex). Списки блокировок принимаются только с его подписью.
+    # Можно не заполнять, а положить файл localnet-admin.pub рядом с программой или настройками.
+    admin_public_key: str = ""
     avatar: str = ""
     check_updates: bool = True
 

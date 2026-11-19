@@ -52,6 +52,8 @@ class Presence:
     file_port: int
     version: str
     ts: float
+    ident: str = ""
+    ban_version: int = 0
     avatar: str = ""
 
 
@@ -63,6 +65,8 @@ def build_packet(
     secret: str = "",
     ptype: str = "hello",
     ts: Optional[float] = None,
+    ident: str = "",
+    ban_version: int = 0,
     *,
     avatar: str = "",
 ) -> bytes:
@@ -77,6 +81,10 @@ def build_packet(
         "version": __version__,
         "ts": round(time.time() if ts is None else ts, 3),
     }
+    if ident:
+        pkt["ident"] = ident[:64]
+    if ban_version:
+        pkt["bv"] = int(ban_version)
     if ptype == "hello" and avatar_pixels(avatar):
         pkt["avatar"] = avatar
     pkt["sig"] = sign(pkt, secret)
@@ -126,6 +134,12 @@ def parse_packet(data: bytes, secret: str = "", now: Optional[float] = None) -> 
         if abs(current - float(ts)) > MAX_CLOCK_SKEW:
             return None
     version = obj.get("version")
+    ident = obj.get("ident", "")
+    bv = obj.get("bv", 0)
+    if not isinstance(ident, str) or len(ident) > 64:
+        return None
+    if not isinstance(bv, int) or isinstance(bv, bool) or bv < 0:
+        return None
     avatar = obj.get("avatar", "")
     return Presence(
         type=ptype,
@@ -135,6 +149,8 @@ def parse_packet(data: bytes, secret: str = "", now: Optional[float] = None) -> 
         file_port=obj["file_port"],
         version=version if isinstance(version, str) else "",
         ts=float(ts),
+        ident=ident,
+        ban_version=bv,
         avatar=avatar if avatar_pixels(avatar) else "",
     )
 
@@ -189,7 +205,9 @@ class PeerRegistry:
             peer = self._peers.get(presence.node_id)
             if peer is None:
                 for old_id, old in list(self._peers.items()):
-                    if not old.online and old.ip == ip and old.nickname == presence.nickname:
+                    same = (old.ident and old.ident == presence.ident) or (
+                        old.ip == ip and old.nickname == presence.nickname)
+                    if not old.online and same:
                         removed.append(self._peers.pop(old_id))
                 peer = Peer(
                     node_id=presence.node_id,
@@ -200,6 +218,8 @@ class PeerRegistry:
                     version=presence.version,
                     last_seen=now,
                     online=True,
+                    ident=presence.ident,
+                    ban_version=presence.ban_version,
                     avatar=presence.avatar,
                 )
                 self._peers[peer.node_id] = peer
@@ -217,6 +237,9 @@ class PeerRegistry:
             peer.msg_port = presence.msg_port
             peer.file_port = presence.file_port
             peer.version = presence.version
+            changed = changed or peer.ban_version != presence.ban_version
+            peer.ident = presence.ident
+            peer.ban_version = presence.ban_version
             peer.avatar = presence.avatar
             peer.last_seen = now
             peer.online = True
@@ -265,9 +288,15 @@ class Discovery:
         on_peer_updated: Optional[Callable[[Peer], None]] = None,
         on_peer_offline: Optional[Callable[[Peer], None]] = None,
         on_peer_removed: Optional[Callable[[Peer], None]] = None,
+        ident: str = "",
+        get_ban_version: Optional[Callable[[], int]] = None,
+        announce: bool = True,
         get_avatar: Optional[Callable[[], str]] = None,
     ) -> None:
         self.node_id = node_id
+        self.ident = ident
+        self.get_ban_version = get_ban_version or (lambda: 0)
+        self.announce = announce  # False — только слушать (админ-панель)
         self.get_nickname = get_nickname
         self.msg_port = msg_port
         self.file_port = file_port
@@ -357,10 +386,11 @@ class Discovery:
 
     def _packet(self, ptype: str = "hello") -> bytes:
         return build_packet(self.node_id, self.get_nickname(), self.msg_port, self.file_port,
-                            self.secret, ptype, avatar=self.get_avatar() if self.get_avatar else "")
+                            self.secret, ptype, ident=self.ident, ban_version=self.get_ban_version(),
+                            avatar=self.get_avatar() if self.get_avatar else "")
 
     def _send_all(self, data: bytes) -> None:
-        if self._send_sock is None:
+        if self._send_sock is None or not self.announce:
             return
         targets = list(self.broadcast_addresses) + list(self.static_peers)
         if self.multicast_group:

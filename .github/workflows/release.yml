@@ -52,6 +52,11 @@ jobs:
           timeout 8 xvfb-run -a "$HOME/.local/bin/localnet" </dev/null >/dev/null 2>&1; code=$?
           set -e
           echo "GUI (собранная программа): $code"; test "$code" -eq 124
+          # Админ-панель — отдельный файл рядом с программой
+          set +e
+          timeout 6 xvfb-run -a "$RUNNER_TEMP/LocalNET-$TAG-linux-x86_64/LocalNET-Admin" </dev/null >/dev/null 2>&1; code=$?
+          set -e
+          echo "Админ-панель: $code"; test "$code" -eq 124
           # Вариант для системного python3 (без pyzmq) — CLI.
           export HOME="$RUNNER_TEMP/home-py"; mkdir -p "$HOME"
           PATH=/usr/bin:/bin sh "LocalNET-$TAG-python/install.sh"

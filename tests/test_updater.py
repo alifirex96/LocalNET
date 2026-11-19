@@ -8,7 +8,7 @@ import pytest
 
 from localnet import updater
 
-TAG = "v0.4.1"
+TAG = "v0.4.2"
 ASSET = f"LocalNET-{TAG}-python.tar.gz"
 
 
@@ -16,7 +16,7 @@ def _archive(extra=None):
     prefix = f"LocalNET-{TAG}-python/localnet"
     data = io.BytesIO()
     with tarfile.open(fileobj=data, mode="w:gz") as archive:
-        entries = {f"{prefix}/__init__.py": b"__version__ = '0.4.1'\n",
+        entries = {f"{prefix}/__init__.py": b"__version__ = '0.4.2'\n",
                    f"{prefix}/__main__.py": b"pass\n", **(extra or {})}
         for name, content in entries.items():
             entry = tarfile.TarInfo(name)
@@ -53,5 +53,5 @@ def test_install_checks_digest_and_rejects_untrusted_paths(tmp_path, monkeypatch
     valid = _archive()
     monkeypatch.setattr(updater, "_fetch", lambda *_: valid)
     updater.install_release(updater.Release(TAG, ASSET, hashlib.sha256(valid).hexdigest()), package)
-    assert "0.4.1" in (package / "__init__.py").read_text(encoding="utf-8")
+    assert "0.4.2" in (package / "__init__.py").read_text(encoding="utf-8")
     assert config.read_text(encoding="utf-8") == "user settings"

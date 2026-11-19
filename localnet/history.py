@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import getpass
+import json
 import logging
 import socket
 import threading
@@ -21,6 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Optional
 
+from .attachments import ImageAttachment
 from .models import ALL_CHAT, ChatMessage, Transfer, TransferDirection, TransferState
 
 try:
@@ -35,7 +37,8 @@ SCHEMA_VERSION = 1
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS contacts (
-    node_id TEXT PRIMARY KEY, nickname TEXT NOT NULL, ip TEXT, last_seen REAL);
+    node_id TEXT PRIMARY KEY, nickname TEXT NOT NULL, ip TEXT, last_seen REAL,
+    ident TEXT NOT NULL DEFAULT '', hidden INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS messages (
     msg_id TEXT PRIMARY KEY, conv TEXT NOT NULL, sender_id TEXT NOT NULL, sender_nick TEXT NOT NULL,
     text TEXT NOT NULL, recipient TEXT, ts REAL NOT NULL, outgoing INTEGER NOT NULL,
@@ -54,6 +57,9 @@ CREATE TABLE IF NOT EXISTS transfers (
     sha256 TEXT, state TEXT NOT NULL, error TEXT, started REAL NOT NULL, finished REAL,
     speed REAL, offset INTEGER);
 CREATE INDEX IF NOT EXISTS transfers_conv ON transfers (conv, started);
+CREATE TABLE IF NOT EXISTS image_attachments (transfer_id TEXT PRIMARY KEY, metadata TEXT NOT NULL);
+CREATE TRIGGER IF NOT EXISTS transfers_delete_image AFTER DELETE ON transfers
+BEGIN DELETE FROM image_attachments WHERE transfer_id=old.transfer_id; END;
 """
 
 _MESSAGE_COLUMNS = "msg_id, sender_id, sender_nick, text, recipient, ts, outgoing, targets, read_sent, queued"
@@ -113,10 +119,9 @@ class HistoryStore:
             self._db = sqlite3.connect(target, check_same_thread=False, timeout=5)
             self._db.executescript(_SCHEMA)
             self._db.create_function("casefold", 1, str.casefold)
-            self._db.execute("BEGIN IMMEDIATE")
-            if not any(row[1] == "queued" for row in self._db.execute("PRAGMA table_info(messages)")):
-                self._db.execute("ALTER TABLE messages ADD COLUMN queued INTEGER NOT NULL DEFAULT 0")
-            self._db.commit()
+            with self._db:
+                self._db.execute("BEGIN IMMEDIATE")
+                self._migrate()
             for pragma in ("PRAGMA journal_mode=WAL", "PRAGMA synchronous=NORMAL"):
                 try:
                     self._db.execute(pragma)
@@ -136,6 +141,17 @@ class HistoryStore:
         self.enabled = enabled and self.persistent
 
     # ------------------------------------------------------------------ служебное
+
+    def _migrate(self) -> None:
+        """Добавляет столбцы, появившиеся в новых версиях (старые файлы истории остаются рабочими)."""
+        cols = {r[1] for r in self._db.execute("PRAGMA table_info(contacts)").fetchall()}
+        if "ident" not in cols:
+            self._db.execute("ALTER TABLE contacts ADD COLUMN ident TEXT NOT NULL DEFAULT ''")
+        if "hidden" not in cols:
+            self._db.execute("ALTER TABLE contacts ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0")
+        columns = {row[1] for row in self._db.execute("PRAGMA table_info(messages)")}
+        if "queued" not in columns:
+            self._db.execute("ALTER TABLE messages ADD COLUMN queued INTEGER NOT NULL DEFAULT 0")
 
     def close(self) -> None:
         with self._lock:
@@ -182,15 +198,59 @@ class HistoryStore:
 
     # ------------------------------------------------------------------ контакты
 
-    def upsert_contact(self, node_id: str, nickname: str, ip: str, last_seen: float) -> None:
+    def upsert_contact(self, node_id: str, nickname: str, ip: str, last_seen: float, ident: str = "") -> None:
         if self._store():
-            self._exec("INSERT INTO contacts VALUES (?, ?, ?, ?) ON CONFLICT(node_id) DO UPDATE SET "
-                       "nickname=excluded.nickname, ip=excluded.ip, last_seen=excluded.last_seen",
-                       (node_id, nickname, ip, last_seen))
+            self._exec("INSERT INTO contacts (node_id, nickname, ip, last_seen, ident) VALUES (?, ?, ?, ?, ?) "
+                       "ON CONFLICT(node_id) DO UPDATE SET nickname=excluded.nickname, ip=excluded.ip, "
+                       "last_seen=excluded.last_seen, "
+                       "ident=CASE WHEN excluded.ident != '' THEN excluded.ident ELSE contacts.ident END",
+                       (node_id, nickname, ip, last_seen, ident))
 
-    def contacts(self) -> dict[str, tuple[str, str, float]]:
-        rows = self._exec("SELECT node_id, nickname, ip, last_seen FROM contacts", commit=False)
+    def contacts(self, include_hidden: bool = False) -> dict[str, tuple[str, str, float]]:
+        where = "" if include_hidden else "WHERE hidden=0"
+        rows = self._exec(f"SELECT node_id, nickname, ip, last_seen FROM contacts {where}", commit=False)
         return {r[0]: (r[1], r[2] or "", r[3] or 0.0) for r in rows}
+
+    def contact_ident(self, node_id: str) -> str:
+        rows = self._exec("SELECT ident FROM contacts WHERE node_id=?", (node_id,), commit=False)
+        return rows[0][0] if rows else ""
+
+    def set_hidden(self, node_id: str, hidden: bool) -> None:
+        if self._store():
+            self._exec("UPDATE contacts SET hidden=? WHERE node_id=?", (int(hidden), node_id))
+
+    def find_duplicates(self, node_id: str, ident: str, nickname: str, ip: str) -> list[str]:
+        """Старые записи того же человека под другим ID узла.
+
+        Совпадение по отпечатку «пользователь@компьютер»; для записей старых версий
+        без отпечатка — по нику и IP-адресу одновременно.
+        """
+        rows = self._exec(
+            "SELECT node_id FROM contacts WHERE node_id != ? AND ((? != '' AND ident = ?) "
+            "OR (ident = '' AND nickname = ? AND ip = ?))",
+            (node_id, ident, ident, nickname, ip), commit=False)
+        return [r[0] for r in rows]
+
+    def merge_contact(self, old: str, new: str) -> None:
+        """Переносит всю переписку и отметки с ``old`` на ``new`` и удаляет старую запись."""
+        if self._db is None or old == new:
+            return
+        with self._lock:
+            for sql in (
+                "UPDATE messages SET conv=? WHERE conv=?",
+                "UPDATE messages SET sender_id=? WHERE sender_id=?",
+                "UPDATE messages SET recipient=? WHERE recipient=?",
+                "UPDATE OR IGNORE receipts SET peer_id=? WHERE peer_id=?",
+                "UPDATE OR IGNORE reactions SET peer_id=? WHERE peer_id=?",
+                "UPDATE transfers SET conv=? WHERE conv=?",
+                "UPDATE transfers SET peer_id=? WHERE peer_id=?",
+            ):
+                self._exec(sql, (new, old), commit=False)
+            self._exec("DELETE FROM receipts WHERE peer_id=?", (old,), commit=False)
+            self._exec("DELETE FROM reactions WHERE peer_id=?", (old,), commit=False)
+            self._exec("DELETE FROM contacts WHERE node_id=?", (old,), commit=False)
+            self._exec("UPDATE contacts SET hidden=0 WHERE node_id=?", (new,))
+        log.info("Записи %s объединены с %s", old[:8], new[:8])
 
     # ------------------------------------------------------------------ сообщения
 
@@ -206,12 +266,15 @@ class HistoryStore:
             if not self._store():
                 return None
             try:
+                conv = self.conv_of(msg)
                 with self._db:
                     cursor = self._db.execute(
                         f"INSERT OR IGNORE INTO messages (conv, {_MESSAGE_COLUMNS}) "
                         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
-                        (self.conv_of(msg), msg.msg_id, msg.sender_id, msg.sender_nick, msg.text,
+                        (conv, msg.msg_id, msg.sender_id, msg.sender_nick, msg.text,
                          msg.to, msg.ts, int(msg.outgoing), targets, int(msg.queued)))
+                    if cursor.rowcount:
+                        self._db.execute("UPDATE contacts SET hidden=0 WHERE node_id=?", (conv,))
                 return cursor.rowcount == 1
             except sqlite3.DatabaseError as exc:
                 log.warning("Не удалось сохранить сообщение: %s", exc)
@@ -224,6 +287,67 @@ class HistoryStore:
             "AND r.peer_id=m.recipient AND r.kind IN ('delivered', 'read')) ORDER BY ts, rowid",
             (node_id,), commit=False)
         return [self._stored_message(row, row[4]).msg for row in rows]
+
+    def message_sender(self, msg_id: str) -> Optional[str]:
+        rows = self._exec("SELECT sender_id FROM messages WHERE msg_id=?", (msg_id,), commit=False)
+        return rows[0][0] if rows else None
+
+    def delete_messages(self, msg_ids: list[str], only_sender: Optional[str] = None) -> list[str]:
+        """Удаляет сообщения (и их отметки/реакции). ``only_sender`` — удалять только его сообщения.
+
+        Возвращает id действительно удалённых сообщений.
+        """
+        if self._db is None or not msg_ids:
+            return []
+        deleted: list[str] = []
+        with self._lock:
+            for i in range(0, len(msg_ids), 500):
+                chunk = msg_ids[i:i + 500]
+                marks = ",".join("?" * len(chunk))
+                cond, args = f"msg_id IN ({marks})", list(chunk)
+                if only_sender is not None:
+                    cond += " AND sender_id=?"
+                    args.append(only_sender)
+                ids = [r[0] for r in self._exec(f"SELECT msg_id FROM messages WHERE {cond}", args, commit=False)]
+                if not ids:
+                    continue
+                m2 = ",".join("?" * len(ids))
+                for table in ("messages", "receipts", "reactions"):
+                    self._exec(f"DELETE FROM {table} WHERE msg_id IN ({m2})", ids, commit=False)
+                deleted += ids
+            self._exec("SELECT 1")  # commit
+        return deleted
+
+    def delete_transfer(self, transfer_id: str) -> None:
+        self._exec("DELETE FROM transfers WHERE transfer_id=?", (transfer_id,))
+
+    def delete_conversation(self, conv: str) -> None:
+        """Удаляет переписку и записи о файлах диалога; собеседник скрывается из списка до новой активности."""
+        if self._db is None:
+            return
+        with self._lock:
+            self._exec("DELETE FROM receipts WHERE msg_id IN (SELECT msg_id FROM messages WHERE conv=?)", (conv,),
+                       commit=False)
+            self._exec("DELETE FROM reactions WHERE msg_id IN (SELECT msg_id FROM messages WHERE conv=?)", (conv,),
+                       commit=False)
+            self._exec("DELETE FROM messages WHERE conv=?", (conv,), commit=False)
+            self._exec("DELETE FROM transfers WHERE conv=?", (conv,), commit=False)
+            self._exec("UPDATE contacts SET hidden=1 WHERE node_id=?", (conv,))
+
+    # ------------------------------------------------------------------ блокировки
+
+    def save_bans(self, wire: dict) -> None:
+        self._exec("INSERT OR REPLACE INTO meta VALUES ('bans', ?)", (json.dumps(wire, ensure_ascii=False),))
+
+    def load_bans(self) -> Optional[dict]:
+        rows = self._exec("SELECT value FROM meta WHERE key='bans'", commit=False)
+        if not rows:
+            return None
+        try:
+            obj = json.loads(rows[0][0])
+            return obj if isinstance(obj, dict) else None
+        except ValueError:
+            return None
 
     def add_receipt(self, msg_id: str, peer_id: str, kind: str) -> None:
         if self._store():
@@ -331,21 +455,30 @@ class HistoryStore:
     # ------------------------------------------------------------------ передачи
 
     def upsert_transfer(self, t: Transfer) -> None:
-        if self._store():
-            self._exec("INSERT OR REPLACE INTO transfers VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                       (t.transfer_id, t.conversation, t.direction.value, t.peer_id, t.peer_nick, t.peer_ip, t.name,
-                        t.size, t.path, t.sha256, t.state.name, t.error, t.started, t.finished_at, t.speed,
-                        t.offset))
+        with self._lock:
+            if not self._store():
+                return
+            try:
+                with self._db:
+                    self._db.execute(
+                        "INSERT OR REPLACE INTO transfers VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (t.transfer_id, t.conversation, t.direction.value, t.peer_id, t.peer_nick, t.peer_ip, t.name,
+                         t.size, t.path, t.sha256, t.state.name, t.error, t.started, t.finished_at, t.speed, t.offset))
+                    if t.image is not None:
+                        self._db.execute("INSERT OR REPLACE INTO image_attachments VALUES (?, ?)",
+                                         (t.transfer_id, json.dumps(t.image.wire(), ensure_ascii=False)))
+            except sqlite3.DatabaseError as exc:
+                log.warning("Не удалось сохранить передачу: %s", exc)
 
     def load_transfers(self, conv: Optional[str] = None, limit: int = 500) -> list[Transfer]:
-        where, args = ("WHERE conv=?", [conv]) if conv is not None else ("", [])
+        where, args = ("WHERE t.conv=?", [conv]) if conv is not None else ("", [])
         rows = self._exec(
-            f"SELECT * FROM (SELECT transfer_id, conv, direction, peer_id, peer_nick, peer_ip, name, size, path, sha256, "
-            f"state, error, started, finished, speed, offset FROM transfers {where} ORDER BY started DESC LIMIT ?) "
+            f"SELECT * FROM (SELECT t.*, i.metadata FROM transfers t LEFT JOIN image_attachments i "
+            f"ON i.transfer_id=t.transfer_id {where} ORDER BY t.started DESC LIMIT ?) "
             f"ORDER BY started", [*args, limit], commit=False)
         result = []
         for (tid, key, direction, peer_id, nick, ip, name, size, path, sha, state, error, started, finished, speed,
-             offset) in rows:
+             offset, metadata) in rows:
             try:
                 st = TransferState[state]
             except KeyError:
@@ -353,10 +486,15 @@ class HistoryStore:
             if not st.finished:
                 # Программа закрылась посреди передачи.
                 st, error = TransferState.FAILED, "прервано при закрытии программы"
+            try:
+                image = ImageAttachment.from_wire(json.loads(metadata)) if metadata else None
+            except ValueError:
+                image = None
             t = Transfer(transfer_id=tid, direction=TransferDirection(direction), peer_id=peer_id, peer_nick=nick,
                          peer_ip=ip or "", name=name, size=size, path=path or "", sha256=sha or "", state=st,
                          done=size if st == TransferState.DONE else 0, offset=offset or 0, started=started,
-                         finished_at=finished or 0.0, speed=speed or 0.0, error=error or "", group=key == ALL_CHAT)
+                         finished_at=finished or 0.0, speed=speed or 0.0, error=error or "",
+                         group=key == ALL_CHAT, image=image)
             result.append(t)
         return result
 
