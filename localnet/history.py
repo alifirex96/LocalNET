@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Optional
 
+from .attachments import ImageAttachment
 from .models import ALL_CHAT, ChatMessage, Transfer, TransferDirection, TransferState
 
 try:
@@ -56,6 +57,9 @@ CREATE TABLE IF NOT EXISTS transfers (
     sha256 TEXT, state TEXT NOT NULL, error TEXT, started REAL NOT NULL, finished REAL,
     speed REAL, offset INTEGER);
 CREATE INDEX IF NOT EXISTS transfers_conv ON transfers (conv, started);
+CREATE TABLE IF NOT EXISTS image_attachments (transfer_id TEXT PRIMARY KEY, metadata TEXT NOT NULL);
+CREATE TRIGGER IF NOT EXISTS transfers_delete_image AFTER DELETE ON transfers
+BEGIN DELETE FROM image_attachments WHERE transfer_id=old.transfer_id; END;
 """
 
 _MESSAGE_COLUMNS = "msg_id, sender_id, sender_nick, text, recipient, ts, outgoing, targets, read_sent, queued"
@@ -451,21 +455,30 @@ class HistoryStore:
     # ------------------------------------------------------------------ передачи
 
     def upsert_transfer(self, t: Transfer) -> None:
-        if self._store():
-            self._exec("INSERT OR REPLACE INTO transfers VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                       (t.transfer_id, t.conversation, t.direction.value, t.peer_id, t.peer_nick, t.peer_ip, t.name,
-                        t.size, t.path, t.sha256, t.state.name, t.error, t.started, t.finished_at, t.speed,
-                        t.offset))
+        with self._lock:
+            if not self._store():
+                return
+            try:
+                with self._db:
+                    self._db.execute(
+                        "INSERT OR REPLACE INTO transfers VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (t.transfer_id, t.conversation, t.direction.value, t.peer_id, t.peer_nick, t.peer_ip, t.name,
+                         t.size, t.path, t.sha256, t.state.name, t.error, t.started, t.finished_at, t.speed, t.offset))
+                    if t.image is not None:
+                        self._db.execute("INSERT OR REPLACE INTO image_attachments VALUES (?, ?)",
+                                         (t.transfer_id, json.dumps(t.image.wire(), ensure_ascii=False)))
+            except sqlite3.DatabaseError as exc:
+                log.warning("Не удалось сохранить передачу: %s", exc)
 
     def load_transfers(self, conv: Optional[str] = None, limit: int = 500) -> list[Transfer]:
-        where, args = ("WHERE conv=?", [conv]) if conv is not None else ("", [])
+        where, args = ("WHERE t.conv=?", [conv]) if conv is not None else ("", [])
         rows = self._exec(
-            f"SELECT * FROM (SELECT transfer_id, conv, direction, peer_id, peer_nick, peer_ip, name, size, path, sha256, "
-            f"state, error, started, finished, speed, offset FROM transfers {where} ORDER BY started DESC LIMIT ?) "
+            f"SELECT * FROM (SELECT t.*, i.metadata FROM transfers t LEFT JOIN image_attachments i "
+            f"ON i.transfer_id=t.transfer_id {where} ORDER BY t.started DESC LIMIT ?) "
             f"ORDER BY started", [*args, limit], commit=False)
         result = []
         for (tid, key, direction, peer_id, nick, ip, name, size, path, sha, state, error, started, finished, speed,
-             offset) in rows:
+             offset, metadata) in rows:
             try:
                 st = TransferState[state]
             except KeyError:
@@ -473,10 +486,15 @@ class HistoryStore:
             if not st.finished:
                 # Программа закрылась посреди передачи.
                 st, error = TransferState.FAILED, "прервано при закрытии программы"
+            try:
+                image = ImageAttachment.from_wire(json.loads(metadata)) if metadata else None
+            except ValueError:
+                image = None
             t = Transfer(transfer_id=tid, direction=TransferDirection(direction), peer_id=peer_id, peer_nick=nick,
                          peer_ip=ip or "", name=name, size=size, path=path or "", sha256=sha or "", state=st,
                          done=size if st == TransferState.DONE else 0, offset=offset or 0, started=started,
-                         finished_at=finished or 0.0, speed=speed or 0.0, error=error or "", group=key == ALL_CHAT)
+                         finished_at=finished or 0.0, speed=speed or 0.0, error=error or "",
+                         group=key == ALL_CHAT, image=image)
             result.append(t)
         return result
 

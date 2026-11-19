@@ -13,13 +13,14 @@ from pathlib import Path
 from typing import Optional
 
 from . import APP_NAME, __version__
+from .attachments import FORMATS, MAX_ALBUM, MAX_CAPTION, ImageAttachment, ImageStore
 from .bans import Ban, BanList, load_trusted_key
 from .config import Config
 from .discovery import Discovery, PeerRegistry
 from .file_transfer import ACCEPT_TIMEOUT, FileTransferManager
 from .history import HistoryStore, history_path_for
 from .messaging import ACK_TIMEOUT, Messenger
-from .models import ALL_CHAT, REACTIONS, AppEvent, ChatMessage, EventType, FileOffer, Peer, Transfer
+from .models import ALL_CHAT, REACTIONS, AppEvent, ChatMessage, EventType, FileOffer, Peer, Transfer, new_id
 from .utils import app_dir, guess_local_ip, local_ident, user_config_dir
 
 log = logging.getLogger(__name__)
@@ -61,6 +62,8 @@ class LocalNetCore:
         self.config = config
         # История и постоянный ID узла (чтобы после перезапуска переписка продолжалась).
         self.history = HistoryStore(history_path_for(config.path), enabled=config.save_history)
+        profile = Path(config.path) if config.path else user_config_dir() / "config.json"
+        self.images = ImageStore(profile.with_suffix(".attachments"))
         self.node_id = self.history.node_id()
         self.ident = local_ident()
         # Блокировки: доверяем только списку, подписанному ключом администратора.
@@ -112,6 +115,7 @@ class LocalNetCore:
             on_update=self._on_transfer,
             on_offer=self._on_offer,
             resolve_peer=self._resolve_peer,
+            image_store=self.images,
         )
         self.discovery: Optional[Discovery] = None
 
@@ -352,14 +356,36 @@ class LocalNetCore:
             targets = [conv]
         self.messenger.send_reaction(msg_id, code, targets)
 
-    def send_file(self, peer_id: str, path: str, *, group: bool = False) -> Transfer:
+    def send_file(self, peer_id: str, path: str, *, group: bool = False, image: Optional[ImageAttachment] = None,
+                  prepared: bool = False, name: str = "") -> Transfer:
         self._check_can_send(peer_id)
         peer = self.registry.get(peer_id)
         if peer is None:
             raise ValueError("Пир не найден")
         if not peer.online:
             raise ValueError(f"{peer.nickname} сейчас offline")
-        return self.files.send_file(peer, path, group=group)
+        return self.files.send_file(peer, path, group=group, image=image, prepared=prepared, name=name)
+
+    def send_images(self, conv: str, paths: list[str], mode: str, caption: str) -> list[Transfer]:
+        caption = caption.strip()
+        if not 1 <= len(paths) <= MAX_ALBUM or len(caption) > MAX_CAPTION or "\x00" in caption:
+            raise ValueError(f"В альбоме может быть до {MAX_ALBUM} изображений и {MAX_CAPTION} символов подписи")
+        if mode not in ("photo", "file") or any(Path(path).suffix.lower() not in FORMATS for path in paths):
+            raise ValueError("Неподдерживаемый режим или формат изображения")
+        if any(not Path(path).is_file() for path in paths):
+            raise ValueError("Один из выбранных файлов больше недоступен")
+        self._check_can_send(None if conv == ALL_CHAT else conv)
+        if conv == ALL_CHAT:
+            peers = [p for p in self.registry.online() if not self.is_banned(p.node_id, p.ident)]
+        else:
+            peer = self.registry.get(conv)
+            peers = [peer] if peer is not None and peer.online else []
+        if not peers:
+            raise ValueError("Получателей в сети нет")
+        album = new_id()
+        return [self.files.send_file(peer, path, group=conv == ALL_CHAT,
+                                     image=ImageAttachment(album, index, len(paths), mode, caption))
+                for peer in peers for index, path in enumerate(paths)]
 
     def cancel_transfer(self, transfer_id: str) -> bool:
         return self.files.cancel(transfer_id)

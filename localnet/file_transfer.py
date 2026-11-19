@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from . import PROTOCOL_VERSION
+from .attachments import FORMATS, MAX_IMAGE_BYTES, ImageAttachment, ImageStore, verify_image
 from .models import FileOffer, Peer, Transfer, TransferDirection, TransferState, new_id
 from .utils import (
     IO_CHUNK,
@@ -124,6 +125,13 @@ def validate_offer(obj: dict, secret: str) -> None:
         raise ProtocolError("Некорректный SHA-256")
     if not verify(obj, secret):
         raise ProtocolError("Неверная подпись (общий секрет не совпадает)")
+    if "image" in obj:
+        try:
+            ImageAttachment.from_wire(obj["image"])
+        except ValueError as exc:
+            raise ProtocolError(str(exc)) from exc
+        if not 0 < size <= MAX_IMAGE_BYTES or Path(obj["name"]).suffix.lower() not in FORMATS:
+            raise ProtocolError("Неподдерживаемый формат или размер изображения")
 
 
 # --------------------------------------------------------------------------- #
@@ -232,6 +240,7 @@ class FileTransferManager:
         on_update: Optional[Callable[[Transfer], None]] = None,
         on_offer: Optional[Callable[[FileOffer], bool]] = None,
         resolve_peer: Optional[Callable[[str, str], tuple[str, str]]] = None,
+        image_store: Optional[ImageStore] = None,
     ) -> None:
         """
         :param on_offer: вызывается в потоке приёма; должен вернуть True (принять)
@@ -247,6 +256,7 @@ class FileTransferManager:
         self.on_update = on_update
         self.on_offer = on_offer
         self.resolve_peer = resolve_peer
+        self.image_store = image_store
 
         self._server: Optional[socket.socket] = None
         self._thread: Optional[threading.Thread] = None
@@ -255,6 +265,8 @@ class FileTransferManager:
         self._transfers: dict[str, Transfer] = {}
         self._sockets: dict[str, socket.socket] = {}
         self._workers: set[threading.Thread] = set()
+        self._active_images: set[tuple[str, str, int, str]] = set()
+        self._image_slots = threading.BoundedSemaphore(4)
 
     # ------------------------------------------------------------------ #
 
@@ -293,7 +305,9 @@ class FileTransferManager:
             except OSError:
                 pass
             self._server = None
-        for w in list(self._workers):
+        with self._lock:
+            workers = list(self._workers)
+        for w in workers:
             w.join(timeout=3)
 
     def get(self, transfer_id: str) -> Optional[Transfer]:
@@ -319,7 +333,8 @@ class FileTransferManager:
                 pass
         return True
 
-    def send_file(self, peer: Peer, path: str | os.PathLike, *, group: bool = False) -> Transfer:
+    def send_file(self, peer: Peer, path: str | os.PathLike, *, group: bool = False,
+                  image: Optional[ImageAttachment] = None, prepared: bool = False, name: str = "") -> Transfer:
         """Запускает отправку файла пиру в фоновом потоке."""
         p = Path(path)
         if not p.is_file():
@@ -330,29 +345,34 @@ class FileTransferManager:
             peer_id=peer.node_id,
             peer_nick=peer.nickname,
             peer_ip=peer.ip,
-            name=p.name,
+            name=safe_filename(name or p.name) if image else p.name,
             size=p.stat().st_size,
             path=str(p),
             group=group,
+            image=image,
         )
         with self._lock:
             self._transfers[t.transfer_id] = t
         self._notify(t)
-        self._spawn(self._send_worker, t, peer.ip, peer.file_port, name=f"send-{t.transfer_id[:8]}")
+        worker = self._send_image_worker if image else self._send_worker
+        args = (t, peer.ip, peer.file_port, prepared) if image else (t, peer.ip, peer.file_port)
+        self._spawn(worker, *args, name=f"send-{t.transfer_id[:8]}")
         return t
 
     # ------------------------------------------------------------------ #
 
     def _spawn(self, target, *args, name: str) -> None:
         th = threading.Thread(target=self._worker_wrapper, args=(target, *args), name=name, daemon=True)
-        self._workers.add(th)
+        with self._lock:
+            self._workers.add(th)
         th.start()
 
     def _worker_wrapper(self, target, *args) -> None:
         try:
             target(*args)
         finally:
-            self._workers.discard(threading.current_thread())
+            with self._lock:
+                self._workers.discard(threading.current_thread())
 
     def _notify(self, t: Transfer) -> None:
         if self.on_update is not None:
@@ -380,13 +400,26 @@ class FileTransferManager:
 
     # ---------------------------- отправка ----------------------------- #
 
-    def _send_worker(self, t: Transfer, ip: str, port: int) -> None:
+    def _send_image_worker(self, t: Transfer, ip: str, port: int, prepared: bool) -> None:
+        with self._image_slots:
+            self._send_worker(t, ip, port, prepared=prepared)
+
+    def _send_worker(self, t: Transfer, ip: str, port: int, *, prepared: bool = False) -> None:
         sock: Optional[socket.socket] = None
         try:
+            if t.cancel_event.is_set():
+                raise Cancelled()
             t.state = TransferState.HASHING
             self._notify(t)
             hash_progress = _ProgressTracker(t, self._notify)
-            t.sha256 = sha256_file(t.path, progress=lambda d, _tot: hash_progress(d), cancel=t.cancel_event)
+            if t.image and not prepared:
+                if self.image_store is None:
+                    raise ProtocolError("Хранилище изображений недоступно")
+                path, t.name, t.sha256 = self.image_store.prepare(
+                    Path(t.path), t.name, t.image.mode, t.cancel_event)
+                t.path, t.size = str(path), path.stat().st_size
+            else:
+                t.sha256 = sha256_file(t.path, progress=lambda d, _tot: hash_progress(d), cancel=t.cancel_event)
             t.done = 0
 
             sock = socket.create_connection((ip, port), timeout=CONNECT_TIMEOUT)
@@ -409,6 +442,8 @@ class FileTransferManager:
             }
             if t.group:
                 offer["group"] = True
+            if t.image:
+                offer["image"] = t.image.wire()
             offer["sig"] = sign(offer, self.secret)
             sock.sendall(MAGIC)
             send_frame(sock, offer)
@@ -481,6 +516,7 @@ class FileTransferManager:
     def _receive_worker(self, conn: socket.socket, ip: str) -> None:
         t: Optional[Transfer] = None
         part_path: Optional[Path] = None
+        active_image = None
         try:
             conn.settimeout(IO_TIMEOUT)
             tune_tcp_socket(conn)
@@ -488,6 +524,21 @@ class FileTransferManager:
                 raise ProtocolError("Неверная сигнатура протокола")
             offer = recv_frame(conn)
             validate_offer(offer, self.secret)
+            image = ImageAttachment.from_wire(offer["image"]) if "image" in offer else None
+            store = self.image_store if image else None
+            if image and store is None:
+                send_frame(conn, {"type": "decline", "reason": "Хранилище изображений недоступно"})
+                return
+            if image:
+                key = (offer["from"], image.album, image.index, offer["sha256"])
+                with self._lock:
+                    duplicate = key in self._active_images
+                    if not duplicate:
+                        self._active_images.add(key)
+                if duplicate:
+                    send_frame(conn, {"type": "decline", "reason": "Изображение уже передаётся"})
+                    return
+                active_image = key
 
             nick, peer_ip = offer["nick"][:64], ip
             if self.resolve_peer is not None:
@@ -503,6 +554,7 @@ class FileTransferManager:
                 sha256=offer["sha256"],
                 state=TransferState.WAITING_ACCEPT,
                 group=offer.get("group") is True,
+                image=image,
             )
             with self._lock:
                 if t.transfer_id in self._transfers:
@@ -522,10 +574,23 @@ class FileTransferManager:
                 self._finish(t, TransferState.DECLINED)
                 return
 
-            download_dir = self.get_download_dir()
+            download_dir = store.root if store else self.get_download_dir()
             download_dir.mkdir(parents=True, exist_ok=True)
+            if store and image:
+                existing = store.find_original(t.sha256)
+                if (existing and existing.stat().st_size == t.size
+                        and sha256_file(existing, cancel=t.cancel_event) == t.sha256):
+                    verify_image(existing, t.name)
+                    send_frame(conn, {"type": "accept", "offset": t.size})
+                    t.path = str(existing)
+                    t.done = t.offset = t.size
+                    store.partial(t.sha256, t.peer_id, image).unlink(missing_ok=True)
+                    _safe_send(conn, {"type": "result", "ok": True})
+                    self._finish(t, TransferState.DONE)
+                    return
             # Имя .part включает хеш — докачка возможна только того же самого файла.
-            part_path = download_dir / f".{t.name}.{t.sha256[:16]}.part"
+            part_path = (store.partial(t.sha256, t.peer_id, image) if store and image else
+                         download_dir / f".{t.name}.{t.sha256[:16]}.part")
             hasher = hashlib.sha256()
             offset = 0
             if part_path.exists():
@@ -557,8 +622,18 @@ class FileTransferManager:
                 self._finish(t, TransferState.FAILED, "Контрольная сумма не совпала — файл удалён")
                 return
 
-            final = unique_path(download_dir, t.name)
-            os.replace(part_path, final)
+            if store:
+                try:
+                    verify_image(part_path, t.name)
+                except (OSError, ValueError, SyntaxError) as exc:
+                    part_path.unlink(missing_ok=True)
+                    _safe_send(conn, {"type": "result", "ok": False, "error": "Изображение повреждено"})
+                    self._finish(t, TransferState.FAILED, f"Изображение повреждено: {exc}")
+                    return
+                final = store.finalize(part_path, t.sha256, t.name)
+            else:
+                final = unique_path(download_dir, t.name)
+                os.replace(part_path, final)
             part_path = None
             t.path = str(final)
             _safe_send(conn, {"type": "result", "ok": True})
@@ -583,6 +658,9 @@ class FileTransferManager:
             if t is not None:
                 self._finish(t, TransferState.FAILED, str(exc))
         finally:
+            if active_image is not None:
+                with self._lock:
+                    self._active_images.discard(active_image)
             try:
                 conn.close()
             except OSError:

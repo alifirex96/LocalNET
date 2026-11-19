@@ -20,7 +20,8 @@ classifiers = [
 
 [project.optional-dependencies]
 dnd = ["tkinterdnd2>=0.4"]
-dev = ["pytest>=7.0", "pyinstaller>=6.0", "tkinterdnd2>=0.4"]
+images = ["Pillow>=9.1"]
+dev = ["pytest>=7.0", "pyinstaller>=6.0", "tkinterdnd2>=0.4", "Pillow>=9.1"]
 
 [project.scripts]
 localnet-cli = "localnet.__main__:main"

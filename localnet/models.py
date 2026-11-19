@@ -9,6 +9,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from .attachments import ImageAttachment
+
 
 # Ключ общего чата (личные чаты адресуются node_id собеседника).
 ALL_CHAT = "__all__"
@@ -119,6 +121,7 @@ class Transfer:
     error: str = ""
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
     group: bool = False
+    image: Optional[ImageAttachment] = None
 
     @property
     def conversation(self) -> str:
@@ -151,6 +154,7 @@ class Transfer:
             error=self.error,
             cancel_event=self.cancel_event,
             group=self.group,
+            image=self.image,
         )
 
 

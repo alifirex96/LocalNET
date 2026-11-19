@@ -13,8 +13,10 @@ from __future__ import annotations
 import logging
 import os
 import queue
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
@@ -31,7 +33,11 @@ from . import APP_NAME, __version__
 from . import updater
 from .aa import AA
 from .app import LocalNetCore
+from .attachments import FORMATS, MAX_ALBUM
 from .history import StoredMessage
+from .image_clipboard import MIME, read_image
+from .image_ui import ImageComposer, ImagePanel, ImageViewer, album_key
+from .messaging import MAX_TEXT
 from .media import IMAGE_SUFFIXES, avatar_photo, encode_avatar, image_preview, table_from_html, table_rows
 from .models import (
     ALL_CHAT,
@@ -79,7 +85,7 @@ class C:
     """Палитра."""
 
     TOP_LEFT = "#2563d9"
-    TOP_RIGHT = "#34b0f0"
+    TOP_RIGHT = "#7750c8"
     BG = "#2a6fdc"
     RAIL = "#2a6fdc"
     RAIL_ACTIVE = "#4f8ff0"
@@ -464,6 +470,9 @@ class LocalNetGui:
         self._update_installed = False
         self._closing = False
         self._update_results = queue.Queue()
+        self._clipboard_images = queue.Queue()
+        self._clipboard_image_pending = False
+        self.image_panel = ImagePanel(self, C, rounded_rect, tk_safe)
 
         self._build()
         self._setup_dnd()
@@ -522,6 +531,7 @@ class LocalNetGui:
         self.chat_frame = tk.Frame(right, bg=C.CHAT_BG)
         self.chat_frame.pack(fill=tk.BOTH, expand=True)
         self.chat = tk.Canvas(self.chat_frame, highlightthickness=0, bd=0, bg=C.CHAT_BG)
+        self.chat.configure(yscrollcommand=lambda *_args: self.image_panel.schedule_visible())
         self.chat.pack(fill=tk.BOTH, expand=True)
         self.chat.bind("<Configure>", lambda _e: self._schedule_chat())
         self.chat.configure(selectbackground="#b3d7f7", selectforeground=C.TEXT)
@@ -1076,6 +1086,7 @@ class LocalNetGui:
             offer.resolve(False)
         self._closing = True
         try:
+            self.image_panel.previews.close()
             self.core.stop()
             if restart:
                 subprocess.Popen([sys.executable, "-m", "localnet", *sys.argv[1:]])
@@ -1360,7 +1371,7 @@ class LocalNetGui:
                 self.preview[key] = (prev[0], f"↓ {t.name}")
                 self._schedule_list()
         if t.state.finished and self._card_state.get(t.transfer_id) != t.state:
-            if t.state == TransferState.DONE and t.path and Path(t.name).suffix.lower() in IMAGE_SUFFIXES:
+            if not t.image and t.state == TransferState.DONE and t.path and Path(t.name).suffix.lower() in IMAGE_SUFFIXES:
                 self._show_image_inline(t, quiet=True)
             if t.state == TransferState.DONE and t.direction == TransferDirection.RECEIVE:
                 self.show_toast(f"Получен файл «{t.name}» от {t.peer_nick}")
@@ -1370,6 +1381,14 @@ class LocalNetGui:
         visible = self.current in (FILES_VIEW, key)
         if not visible:
             self._card_state[t.transfer_id] = t.state
+            return
+        if t.image and self.current != FILES_VIEW:
+            previous = self._card_state.get(t.transfer_id)
+            self._card_state[t.transfer_id] = t.state
+            if not first and previous == t.state == TransferState.TRANSFERRING:
+                self.image_panel.update_progress(t)
+            else:
+                self._schedule_chat()
             return
         card = self._cards.get(t.transfer_id)
         if card is not None and self._card_state.get(t.transfer_id) == t.state and not first:
@@ -1383,6 +1402,8 @@ class LocalNetGui:
         t = offer.transfer
         if t.cancel_event.is_set():
             offer.resolve(False)
+            return
+        if t.image and self.image_panel.consume_decision(offer):
             return
         self.offers[t.transfer_id] = offer
         key = t.conversation
@@ -1485,6 +1506,7 @@ class LocalNetGui:
         if stick is None:
             stick = cv.yview()[1] >= 0.999
         saved = self._saved_selection()
+        self.image_panel.start_draw()
         cv.delete("all")
         cv.avatar_refs = {}
         self._cards.clear()
@@ -1496,6 +1518,12 @@ class LocalNetGui:
         y = 16.0
         last_day = None
         items = self._view_items()
+        albums = {}
+        if self.current != FILES_VIEW:
+            for item in items:
+                transfer = self.transfers.get(item.tid) if item.kind == "transfer" else None
+                if transfer is not None and transfer.image:
+                    albums.setdefault(album_key(transfer), []).append(transfer)
         for item in items:
             day = datetime.fromtimestamp(item.ts).date()
             if day != last_day:
@@ -1506,7 +1534,12 @@ class LocalNetGui:
             elif item.kind == "transfer":
                 t = self.transfers.get(item.tid)
                 if t is not None:
-                    y = self._draw_card(t, y, w)
+                    if t.image and self.current != FILES_VIEW:
+                        album = albums.pop(album_key(t), None)
+                        if album is not None:
+                            y = self.image_panel.draw(album, y, w)
+                    else:
+                        y = self._draw_card(t, y, w)
             else:
                 y = self._draw_pill(item.text, y, w, small=True)
         if not items:
@@ -1526,6 +1559,7 @@ class LocalNetGui:
         cv.configure(scrollregion=(0, 0, w, total_h))
         if stick:
             cv.yview_moveto(1.0)
+        self.image_panel.schedule_visible()
         if saved is not None and saved[0] in self._text_items:
             item = self._text_items[saved[0]]
             cv.select_from(item, saved[1])
@@ -2041,7 +2075,9 @@ class LocalNetGui:
         elif not t.state.finished:
             actions = [("Отменить", lambda: self.core.cancel_transfer(t.transfer_id), False)]
         elif t.state == TransferState.DONE and t.path:
-            if image and preview is None:
+            if t.image:
+                actions.append(("Показать", lambda: ImageViewer(self, [t]), True))
+            elif image and preview is None:
                 actions.append(("Показать", lambda: self._show_image_inline(t), True))
             actions.append(("Открыть папку", lambda: _open_path(os.path.dirname(t.path)), not actions))
         elif out and t.state in (TransferState.FAILED, TransferState.CANCELLED, TransferState.DECLINED):
@@ -2140,7 +2176,8 @@ class LocalNetGui:
             self.show_toast(f"{t.peer_nick} сейчас не в сети")
             return
         try:
-            self.core.send_file(t.peer_id, t.path, group=t.group)
+            self.core.send_file(t.peer_id, t.path, group=t.group, image=t.image,
+                                prepared=bool(t.sha256), name=t.name)
         except (OSError, ValueError) as exc:
             self.show_toast(str(exc))
 
@@ -2189,6 +2226,31 @@ class LocalNetGui:
         if paths:
             self.send_paths(self.current, list(paths))
 
+    def _compose_images(self, key: str, paths: list[str]) -> None:
+        if len(paths) > MAX_ALBUM:
+            self.show_toast(f"Можно отправить до {MAX_ALBUM} изображений за раз.")
+            return
+        draft = self.msg_entry.get("1.0", "end-1c") if key == self.current else ""
+
+        def send(selected, mode, caption, separate):
+            if separate and len(draft.strip()) > MAX_TEXT:
+                raise ValueError(f"Текст сообщения длиннее {MAX_TEXT} символов")
+            self.core.send_images(key, selected, mode, caption)
+            if separate and draft.strip():
+                to = None if key == ALL_CHAT else key
+                msg = self.core.send_message(draft, to)
+                targets = len(self.core.registry.online()) if to is None else 1
+                self._add_message(msg, targets=targets)
+            if key == self.current and self.msg_entry.get("1.0", "end-1c") == draft:
+                self.msg_entry.delete("1.0", tk.END)
+                self.msg_entry.edit_reset()
+            self._close_history_search(restore_chat=False)
+            self.select(key)
+
+        dialog = ImageComposer(self.root, self.image_panel.previews, paths, draft, send)
+        recipient = "Общий чат" if key == ALL_CHAT else tk_safe(self._name(key))
+        dialog.window.title(f"Отправить изображения · {recipient}")
+
     def send_paths(self, key: Optional[str], paths: list[str]) -> int:
         """Отправляет файлы в чат ``key`` (пиру или всем в общем чате). Возвращает число запущенных передач."""
         files, dirs = [], []
@@ -2205,6 +2267,12 @@ class LocalNetGui:
         if key is None or key == FILES_VIEW:
             self.show_toast("Выберите получателя: откройте чат или перетащите файл на собеседника в списке")
             return 0
+        images = [path for path in files if Path(path).suffix.lower() in FORMATS]
+        if images:
+            self._compose_images(key, images)
+            files = [path for path in files if Path(path).suffix.lower() not in FORMATS]
+            if not files:
+                return 0
         if key == ALL_CHAT:
             peers = self.core.registry.online()
             if not peers:
@@ -2345,6 +2413,18 @@ class LocalNetGui:
             self.send_paths(self.current, paths)
             return "break"
         try:
+            advertised = self.root.tk.splitlist(self.root.clipboard_get(type="TARGETS"))
+        except tk.TclError:
+            advertised = ()
+        targets = tuple(target for target, _ in MIME if target in advertised)
+        if targets or sys.platform == "win32":
+            self._paste_image(targets)
+            return "break"
+        self._paste_text()
+        return "break"
+
+    def _paste_text(self) -> None:
+        try:
             text = self.root.clipboard_get()
         except tk.TclError:
             text = ""
@@ -2354,8 +2434,102 @@ class LocalNetGui:
             except tk.TclError:
                 pass
         if text:
+            if text.startswith("file://") and os.path.isfile(_path_from_uri(text.strip())):
+                self.send_paths(self.current, [_path_from_uri(text.strip())])
+                return
             self._insert_draft(text.replace("\r\n", "\n").replace("\r", "\n"))
-        return "break"
+
+    def _paste_image(self, targets) -> None:
+        if self._clipboard_image_pending:
+            return
+        self._clipboard_image_pending = True
+        key = self.current
+
+        def read() -> None:
+            try:
+                contents = read_image(targets)
+                if contents is None:
+                    self._clipboard_images.put(None)
+                    return
+                data, suffix = contents
+                self._clipboard_images.put(str(self.core.images.capture(data, suffix)))
+            except Exception:
+                log.debug("Не удалось прочитать изображение из буфера", exc_info=True)
+                self._clipboard_images.put(None)
+
+        def complete() -> None:
+            try:
+                path = self._clipboard_images.get_nowait()
+            except queue.Empty:
+                self.root.after(45, complete)
+                return
+            self._clipboard_image_pending = False
+            if path and key != FILES_VIEW:
+                self._compose_images(key, [path])
+            else:
+                self._paste_text()
+
+        threading.Thread(target=read, name="image-clipboard", daemon=True).start()
+        self.root.after(45, complete)
+
+    def open_attachment(self, path: str) -> None:
+        if Path(path).exists():
+            _open_path(path)
+        else:
+            self.show_toast("Файл больше недоступен.")
+
+    def copy_attachment(self, path: str) -> None:
+        source = Path(path).resolve()
+        if not source.is_file():
+            self.show_toast("Файл больше недоступен.")
+            return
+        xclip = shutil.which("xclip") if self.root.tk.call("tk", "windowingsystem") == "x11" else None
+        suffix = source.suffix.lower().replace(".jpeg", ".jpg")
+        kind = next((mime for mime, ext in MIME if ext == suffix), None)
+        if xclip and kind:
+            try:
+                subprocess.Popen([xclip, "-selection", "clipboard", "-target", kind, "-i", str(source)],
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                self.show_toast("Изображение скопировано.")
+                return
+            except OSError:
+                pass
+        uri = source.as_uri()
+        self.root.clipboard_clear()
+        self.root.clipboard_append(uri)
+        self.root.clipboard_append(uri + "\r\n", type="text/uri-list")
+        self.show_toast("Изображение скопировано как вложение.")
+
+    def save_attachment(self, source: str, target: str) -> None:
+        done = queue.Queue(maxsize=1)
+
+        def save() -> None:
+            try:
+                destination = Path(target)
+                if Path(source).resolve() == destination.resolve():
+                    done.put(None)
+                    return
+                with tempfile.TemporaryDirectory(dir=destination.parent) as folder:
+                    staging = Path(folder) / "image"
+                    shutil.copyfile(source, staging)
+                    os.replace(staging, destination)
+                done.put(None)
+            except OSError as exc:
+                done.put(str(exc))
+
+        def finish() -> None:
+            try:
+                error = done.get_nowait()
+            except queue.Empty:
+                self.root.after(70, finish)
+                return
+            if error:
+                messagebox.showerror("Сохранение изображения", error, parent=self.root)
+            else:
+                self.show_toast("Изображение сохранено.")
+
+        threading.Thread(target=save, name="image-save", daemon=True).start()
+        self.root.after(70, finish)
 
     def _insert_draft(self, text: str) -> str:
         entry = self.msg_entry
